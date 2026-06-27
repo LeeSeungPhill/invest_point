@@ -1,0 +1,11 @@
+requests>=2.31
+langgraph>=0.2
+langchain-core>=0.3
+
+# --- LLM 백엔드는 택1 (LLM_BACKEND 환경변수로 선택) ---
+# 로컬 Ollama (기본, 키·비용 없음):
+langchain-ollama>=0.2
+# OpenAI 호환 로컬서버(vLLM/LM Studio) 또는 HyperCLOVA X 등:
+# langchain-openai>=0.2
+# Google Gemini:
+# langchain-google-genai>=2.0
