@@ -33,25 +33,25 @@ def get_chat_model(temperature: float = 0.2, max_tokens: int = 2000):
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
         )
 
-    if backend == "openai_compat":
-        # vLLM / LM Studio / llama.cpp server / 네이버 HyperCLOVA X 등
-        # pip install langchain-openai
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "local-model"),
-            base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"),
-            api_key=os.getenv("OPENAI_API_KEY", "not-needed"),  # 로컬 서버는 더미키 허용
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+    # if backend == "openai_compat":
+    #     # vLLM / LM Studio / llama.cpp server / 네이버 HyperCLOVA X 등
+    #     # pip install langchain-openai
+    #     from langchain_openai import ChatOpenAI
+    #     return ChatOpenAI(
+    #         model=os.getenv("OPENAI_MODEL", "local-model"),
+    #         base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"),
+    #         api_key=os.getenv("OPENAI_API_KEY", "not-needed"),  # 로컬 서버는 더미키 허용
+    #         temperature=temperature,
+    #         max_tokens=max_tokens,
+    #     )
 
-    if backend == "google":
-        # pip install langchain-google-genai ; GOOGLE_API_KEY 필요
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
+    # if backend == "google":
+    #     # pip install langchain-google-genai ; GOOGLE_API_KEY 필요
+    #     from langchain_google_genai import ChatGoogleGenerativeAI
+    #     return ChatGoogleGenerativeAI(
+    #         model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
+    #         temperature=temperature,
+    #         max_output_tokens=max_tokens,
+    #     )
 
     raise ValueError(f"알 수 없는 LLM_BACKEND: {backend}")
