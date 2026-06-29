@@ -2,6 +2,10 @@ requests>=2.31
 langgraph>=0.2
 langchain-core>=0.3
 python-dotenv>=1.0
+beautifulsoup4>=4.12
+numpy>=1.26
+pandas>=2.0
+lxml>=5.0
 
 # --- LLM 백엔드는 택1 (LLM_BACKEND 환경변수로 선택) ---
 # 로컬 Ollama (기본, 키·비용 없음):

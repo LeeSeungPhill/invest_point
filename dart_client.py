@@ -65,6 +65,8 @@ class Filing:
     rcept_no: str          # 접수번호 (원본 다운로드 키)
     report_nm: str         # 보고서명
     rcept_dt: str          # 접수일자 YYYYMMDD
+    reprt_code: str = "11011"   # 11013=1분기 11012=반기 11014=3분기 11011=사업
+    bsns_year: str = ""         # 사업연도 YYYY
 
 
 @dataclass
@@ -160,33 +162,48 @@ class DartClient:
         return m[stock_code]
 
     # ------------------------------------------------------------------ #
-    # 2) 최신 정기보고서 찾기
+    # 2) 최신 정기보고서 찾기 (분기 -> 반기 -> 사업 우선순위)
     # ------------------------------------------------------------------ #
-    def latest_periodic_report(self, corp_code: str, lookback_days: int = 420) -> Filing:
-        """pblntf_ty='A'(정기공시) 중 가장 최근 사업/반기/분기 보고서 1건."""
+    def latest_periodic_report(
+        self, corp_code: str,
+        prefer_order: tuple = ("분기보고서", "반기보고서", "사업보고서"),
+        lookback_days: int = 420,
+    ) -> Filing:
+        """prefer_order 우선순위에 따라, 해당 유형 중 가장 최근 보고서 1건을 고른다.
+        기본은 분기 -> 반기 -> 사업(가장 신선한 것 우선). 분기/반기 보고서는
+        '사업의 내용'이 사업보고서보다 간략할 수 있다(필요시 순서를 바꿔 사용)."""
+        memo_key = (corp_code, prefer_order)
+        if not hasattr(self, "_report_memo"):
+            self._report_memo = {}
+        if memo_key in self._report_memo:
+            return self._report_memo[memo_key]
+
         end = time.strftime("%Y%m%d")
         bgn = time.strftime("%Y%m%d", time.localtime(time.time() - lookback_days * 86400))
         data = self._get(
-            "list.json",
-            corp_code=corp_code,
-            bgn_de=bgn,
-            end_de=end,
-            pblntf_ty="A",
-            page_count=100,
+            "list.json", corp_code=corp_code, bgn_de=bgn, end_de=end,
+            pblntf_ty="A", page_count=100,
         ).json()
         self._check_json_status(data, "list.json")
 
-        wanted = ("사업보고서", "반기보고서", "분기보고서")
-        for item in data.get("list", []):   # 최신순 정렬되어 내려옴
-            nm = item.get("report_nm", "")
-            if any(w in nm for w in wanted):
-                return Filing(
-                    corp_code=corp_code,
-                    corp_name=item.get("corp_name", ""),
-                    rcept_no=item["rcept_no"],
-                    report_nm=nm,
-                    rcept_dt=item.get("rcept_dt", ""),
-                )
+        items = data.get("list", [])  # 최신순
+        # 우선순위 유형별로 가장 최근 항목을 찾는다
+        for kind in prefer_order:
+            for item in items:
+                nm = item.get("report_nm", "")
+                if kind in nm:
+                    reprt_code, bsns_year = _infer_reprt(nm, item.get("rcept_dt", ""))
+                    filing = Filing(
+                        corp_code=corp_code,
+                        corp_name=item.get("corp_name", ""),
+                        rcept_no=item["rcept_no"],
+                        report_nm=nm,
+                        rcept_dt=item.get("rcept_dt", ""),
+                        reprt_code=reprt_code,
+                        bsns_year=bsns_year,
+                    )
+                    self._report_memo[memo_key] = filing
+                    return filing
         raise DartError("최근 정기보고서를 찾지 못했습니다.")
 
     # ------------------------------------------------------------------ #
@@ -267,6 +284,23 @@ class DartClient:
 # ---------------------------------------------------------------------- #
 # 모듈 레벨 헬퍼 (파싱 로직)
 # ---------------------------------------------------------------------- #
+def _infer_reprt(report_nm: str, rcept_dt: str) -> tuple[str, str]:
+    """보고서명에서 reprt_code와 사업연도(bsns_year)를 추론.
+    예) '분기보고서 (2025.03)'->(11013,'2025'), '반기보고서 (2025.06)'->(11012,'2025'),
+        '분기보고서 (2025.09)'->(11014,'2025'), '사업보고서 (2024.12)'->(11011,'2024')."""
+    m = re.search(r"\((\d{4})\.(\d{2})\)", report_nm)
+    year = m.group(1) if m else (rcept_dt[:4] if rcept_dt else "")
+    month = m.group(2) if m else ""
+    if "반기" in report_nm:
+        return "11012", year
+    if "사업보고서" in report_nm:
+        return "11011", year
+    if "분기" in report_nm:
+        # 1분기(.03)=11013, 3분기(.09)=11014, 월 정보 없으면 1분기로 가정
+        return ("11014" if month == "09" else "11013"), year
+    return "11011", year
+
+
 def _tag(block: str, tag: str) -> str:
     m = re.search(fr"<{tag}>(.*?)</{tag}>", block, re.S)
     return m.group(1) if m else ""
