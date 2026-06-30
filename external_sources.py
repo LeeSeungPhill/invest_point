@@ -251,10 +251,10 @@ def aggregate_consensus(reports: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------- #
-# comp.fnguide.com 예상실적(컨센서스 추정) — 사용자 지시로 구현
-#   주의: FnGuide ToS는 무단 사용/데이터베이스화를 제한한다. 법적 리스크는
-#   사용자 책임 하에, 호출 최소화(긴 캐시·종목당 1회·UA·rate limit)로 운용.
-#   값 단위는 '억원'(Financial Highlight 기준) — DART(원)와 섞지 말 것.
+# 네이버 종목분석 > Financial Summary (출처: navercomp.wisereport.co.kr / FnGuide)
+#   연간/분기/예상((E)) 매출액·영업이익·당기순이익. 단위: 억원.
+#   주의: 데이터 저작권은 FnGuide. 자동수집/DB화 ToS 리스크는 사용자 책임.
+#   호출 최소화(긴 캐시·종목당 1회·UA/Referer).
 # ---------------------------------------------------------------------- #
 def _to_num(x) -> Optional[float]:
     if x is None:
@@ -271,11 +271,59 @@ def _to_num(x) -> Optional[float]:
         return None
 
 
-def fetch_fnguide_estimates(stock_code: str, *, cache_ttl: int = 86400) -> dict:
-    """Snapshot의 Financial Highlight에서 연간 (E)=추정 컬럼의
-    매출액/영업이익/당기순이익을 추출. 단위: 억원."""
+def _flatten_cols(tbl) -> list[str]:
+    return ["/".join(str(c) for c in col) if isinstance(col, tuple) else str(col)
+            for col in tbl.columns]
+
+
+def _parse_finsummary(tables) -> tuple[dict, dict, dict]:
+    """매출액·영업이익 행을 가진 표(들)에서 연간/분기/예상을 추출.
+    분기표: 컬럼 라벨에 03/06/09 월이 섞여 있음. 연간표: 대부분 12월.
+    (E) 포함 컬럼은 추정치로 분리."""
+    target = ("매출액", "영업이익", "당기순이익")
+    annual: dict = {}
+    quarter: dict = {}
+    estimates: dict = {}
+
+    for t in tables:
+        if t is None or t.shape[1] < 2 or len(t) == 0:
+            continue
+        try:
+            first = t.iloc[:, 0].astype(str).str.replace(" ", "")
+        except (IndexError, KeyError):
+            continue
+        if not (first.str.contains("매출액").any() and first.str.contains("영업이익").any()):
+            continue
+
+        cols = _flatten_cols(t)
+        # 분기표 판별: 데이터 컬럼 라벨에 03/06/09가 보이면 분기
+        months = re.findall(r"/(\d{2})", " ".join(cols))
+        is_quarter = any(mm in ("03", "06", "09") for mm in months)
+        bucket = quarter if is_quarter else annual
+        name_col = t.columns[0]
+
+        for _, row in t.iterrows():
+            acct = str(row[name_col]).replace(" ", "")
+            acct = next((a for a in target if a in acct), None)
+            if not acct:
+                continue
+            for i, c in enumerate(cols):
+                if i == 0:
+                    continue
+                val = _to_num(row.iloc[i])
+                if val is None:
+                    continue
+                bucket.setdefault(c, {})[acct] = val
+                if "(E)" in c.replace(" ", ""):
+                    estimates.setdefault(c, {})[acct] = val
+    return annual, quarter, estimates
+
+
+def fetch_naver_financial_summary(stock_code: str, *, cache_ttl: int = 86400) -> dict:
+    """네이버 종목분석의 Financial Summary(WISEreport)에서
+    연간/분기/예상 매출액·영업이익·당기순이익을 추출. 단위: 억원."""
     code = stock_code.zfill(6)
-    ck = f"fnguide_est::{code}"
+    ck = f"naver_finsum::{code}"
     cached = _cache_get(ck, cache_ttl)
     if cached:
         return cached
@@ -285,61 +333,38 @@ def fetch_fnguide_estimates(stock_code: str, *, cache_ttl: int = 86400) -> dict:
     except ImportError:
         raise SourceError("pandas/lxml 필요: pip install pandas lxml")
 
-    url = ("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
-           f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=11&stkGb=701")
-    r = _request("GET", url, headers={"User-Agent": UA})
+    base = os.getenv("NAVER_FINSUM_URL",
+                     "https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx")
+    url = f"{base}?cmp_cd={code}&cn="
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Referer": "https://finance.naver.com/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+    r = _request("GET", url, headers=headers)
+    r.encoding = r.apparent_encoding or "utf-8"
     html_text = r.text
+    if len(html_text) < 2000:
+        raise SourceError(f"WISEreport 응답이 짧음({len(html_text)}B) — 엔드포인트/종목 확인 필요.")
 
     import io
     try:
         tables = pd.read_html(io.StringIO(html_text))
-    except Exception as e:  # noqa: BLE001  read_html 내부 ValueError/IndexError 등 흡수
-        raise SourceError(f"표 파싱 실패(종목/페이지 구조 확인): {type(e).__name__}")
-    target_rows = ("매출액", "영업이익", "당기순이익")
+    except Exception as e:  # noqa: BLE001  read_html 내부 오류 흡수
+        raise SourceError(f"표 파싱 실패(페이지 구조 확인): {type(e).__name__}")
 
-    fin_tbl = None
-    for t in tables:
-        # 빈/비정형 테이블 방어 (작은 종목 페이지에 자주 섞임)
-        if t is None or t.shape[1] == 0 or len(t) == 0:
-            continue
-        try:
-            first_col = t.iloc[:, 0].astype(str).str.replace(" ", "")
-        except (IndexError, KeyError):
-            continue
-        if first_col.str.contains("매출액").any() and first_col.str.contains("영업이익").any():
-            fin_tbl = t
-            break
-    if fin_tbl is None:
-        raise SourceError("Financial Highlight 표를 찾지 못했습니다(페이지 구조 변경 가능).")
-
-    # 컬럼 라벨 평탄화
-    cols = ["/".join(str(c) for c in col) if isinstance(col, tuple) else str(col)
-            for col in fin_tbl.columns]
-    est_cols = [i for i, c in enumerate(cols) if "(E)" in c.replace(" ", "")]
-
-    annual: dict = {}
-    estimates: dict = {}
-    name_col = fin_tbl.columns[0]
-    for _, row in fin_tbl.iterrows():
-        acct = str(row[name_col]).replace(" ", "")
-        acct = next((a for a in target_rows if a in acct), None)
-        if not acct:
-            continue
-        for i, c in enumerate(cols):
-            if i == 0:
-                continue
-            val = _to_num(row.iloc[i])
-            if val is None:
-                continue
-            annual.setdefault(c, {})[acct] = val
-            if i in est_cols:
-                estimates.setdefault(c, {})[acct] = val
+    annual, quarter, estimates = _parse_finsummary(tables)
+    if not (annual or quarter):
+        raise SourceError("Financial Summary 표를 찾지 못했습니다(페이지 구조 변경 가능).")
 
     result = {
-        "source": "comp.fnguide.com",
+        "source": "finance.naver.com (WISEreport/FnGuide)",
         "unit": "억원",
         "fetched_at": time.strftime("%Y-%m-%d"),
         "annual": annual,
+        "quarter": quarter,
         "estimates": estimates,
     }
     _cache_put(ck, result)

@@ -161,13 +161,13 @@ def fetch_research(state: AnalysisState) -> AnalysisState:
 
 
 def fetch_estimates(state: AnalysisState) -> AnalysisState:
-    """comp.fnguide.com 예상실적(매출/영업이익/순이익 추정). 단위 억원."""
+    """네이버 종목분석 Financial Summary(연간/분기/예상). 단위 억원."""
     if not state.get("stock_code"):
         return {"sources_status": {"estimates": "skip"}}
     try:
-        from external_sources import fetch_fnguide_estimates
-        est = fetch_fnguide_estimates(state["stock_code"])
-        has = bool(est.get("estimates"))
+        from external_sources import fetch_naver_financial_summary
+        est = fetch_naver_financial_summary(state["stock_code"])
+        has = bool(est.get("estimates") or est.get("annual") or est.get("quarter"))
         return {"estimates": est,
                 "sources_status": {"estimates": "ok" if has else "empty"}}
     except Exception as e:  # noqa: BLE001
@@ -285,12 +285,25 @@ def analyze(state: AnalysisState) -> AnalysisState:
         for r in reports[:15]) or "(리포트 목록 없음)"
 
     est = state.get("estimates") or {}
-    est_lines = []
-    for col, vals in (est.get("estimates") or {}).items():
-        parts = ", ".join(f"{k} {v:,.0f}" for k, v in vals.items())
-        est_lines.append(f"- {col}: {parts}")
-    est_block = ("(단위: 억원, 출처 comp.fnguide.com)\n" + "\n".join(est_lines)) \
-        if est_lines else "(예상실적 없음)"
+
+    def _fmt_periods(d: dict, limit: int = 6) -> str:
+        rows = []
+        for col, vals in list(d.items())[:limit]:
+            parts = ", ".join(f"{k} {v:,.0f}" for k, v in vals.items())
+            rows.append(f"  · {col}: {parts}")
+        return "\n".join(rows)
+
+    if est.get("annual") or est.get("quarter") or est.get("estimates"):
+        blocks = ["(단위: 억원, 출처 네이버 종목분석/WISEreport)"]
+        if est.get("annual"):
+            blocks.append("연간:\n" + _fmt_periods(est["annual"]))
+        if est.get("quarter"):
+            blocks.append("분기:\n" + _fmt_periods(est["quarter"]))
+        if est.get("estimates"):
+            blocks.append("예상((E)):\n" + _fmt_periods(est["estimates"]))
+        est_block = "\n".join(blocks)
+    else:
+        est_block = "(예상/요약 실적 없음)"
 
     retrieved = state.get("retrieved_chunks") or []
     valid_ids = ", ".join(c["chunk_id"] for c in retrieved) or "(없음)"
@@ -299,7 +312,7 @@ def analyze(state: AnalysisState) -> AnalysisState:
         f"종목: {state.get('corp_name')} ({state.get('stock_code')})\n"
         f"근거 공시: {state.get('report_nm')} (접수 {state.get('rcept_dt')})\n\n"
         f"[재무 시계열(실적, DART)]\n{fin_block}\n\n"
-        f"[예상 실적(컨센서스 추정, fnguide)]\n{est_block}\n\n"
+        f"[연간/분기/예상 실적(네이버 종목분석)]\n{est_block}\n\n"
         f"[애널리스트 컨센서스(자체 집계)]\n{cons_block}\n\n"
         f"[최근 리포트 목록]\n{rep_block}\n\n"
         f"[최근 뉴스]\n{news_block}\n\n"
