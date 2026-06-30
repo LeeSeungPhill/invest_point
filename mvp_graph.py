@@ -161,7 +161,11 @@ def fetch_research(state: AnalysisState) -> AnalysisState:
 
 
 def fetch_estimates(state: AnalysisState) -> AnalysisState:
-    """네이버 종목분석 Financial Summary(연간/분기/예상). 단위 억원."""
+    """네이버 종목분석 Financial Summary(연간/분기/예상). 단위 억원.
+    데이터가 토큰(encparam) 게이트 뒤 AJAX로 로드되는 경우가 있어 기본 비활성.
+    ENABLE_ESTIMATES=1 로 켜거나, FnSpace 같은 라이선스 소스로 교체 후 사용."""
+    if os.getenv("ENABLE_ESTIMATES", "0") != "1":
+        return {"sources_status": {"estimates": "off"}}
     if not state.get("stock_code"):
         return {"sources_status": {"estimates": "skip"}}
     try:
