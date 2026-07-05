@@ -22,7 +22,8 @@ from collections import defaultdict
 from mvp_graph import run
 
 DEFAULT = ["005930", "000660", "112610", "035420", "247540"]
-SOURCES = ["dart_business", "dart_financials", "news", "research", "estimates", "rag"]
+SOURCES = ["dart_business", "dart_financials", "news", "research", "fnguide",
+          "price", "disclosures", "biz_summary", "rag"]
 
 
 def main(codes: list[str]):
@@ -55,11 +56,11 @@ def main(codes: list[str]):
     print("\n" + "=" * 60)
     print(f"종목 {n}개 / 평균 {sum(timings)/len(timings):.1f}s" if timings else "타이밍 없음")
     print("=" * 60)
-    print(f"{'source':16} {'ok':>4} {'empty':>6} {'error':>6} {'skip':>5}")
+    print(f"{'source':16} {'ok':>4} {'partial':>7} {'empty':>6} {'error':>6} {'skip':>5} {'off':>4}")
     for s in SOURCES:
         t = tally[s]
-        print(f"{s:16} {t['ok']:>4} {t['empty']:>6} {t['error']:>6} {t['skip']:>5}"
-              f"   (ok {100*t['ok']//max(n,1)}%)")
+        print(f"{s:16} {t['ok']:>4} {t['partial']:>7} {t['empty']:>6} {t['error']:>6} "
+              f"{t['skip']:>5} {t['off']:>4}   (ok {100*t['ok']//max(n,1)}%)")
 
     # 합격 가이드(주관적 기준 예시)
     print("\n판정 가이드:")
