@@ -6,6 +6,11 @@ mvp_graph.py
 2단계: 수집물로 성장/가치 정량 시그널(invest_point.py)을 코드가 계산하고,
        LLM이 이슈/투자포인트 + 성장 시나리오/가치 포지션 해석을 작성한 뒤
        citation.py로 원문 인용 품질을 검증하는 LangGraph 골격.
+3단계: 분석 '전' 서로 다른 소스 간 교차검증(cross_check.py)으로 잘못된 값이
+       LLM에게 넘어가는 것을 막고, 분석 '후' LLM 리포트가 invest_point 시그널과
+       실제로 같은 방향을 말하는지 + 제공되지 않은 파생 수치를 지어내지 않았는지
+       검증(scenario_check.py)한다. 불일치 발견 시 1회 자동 재생성 후 그래도
+       남아있으면 최종 결과에 경고를 남긴다(무한 재시도 금지).
 
 설계 원칙(앞선 검토와 일관):
   - LLM에게 매출을 '포인트 숫자'로 예측시키지 않는다.
@@ -13,6 +18,10 @@ mvp_graph.py
     정성 해석 + 시나리오' 작성만 담당한다.
   - 모든 판단은 어떤 데이터(공시 문장/재무 항목)에 근거했는지 밝히게 한다.
   - 각 노드는 실패해도 그래프를 죽이지 않고 state['errors']에 적재한다.
+  - 재생성 루프는 LangGraph의 fan-in(여러 노드가 analyze로 모이는 구조) 때문에
+    analyze로 직접 되돌아가는 사이클을 만들지 않는다(다른 선행 노드들이 다시
+    실행되지 않아 join이 멈출 수 있음). 대신 회귀 전용 노드를 별도로 두어
+    '최대 1회'가 사이클이 아니라 조건부 분기로 구조적으로 보장되게 한다.
 
 필요 환경변수:
   OPENDART_API_KEY
@@ -37,6 +46,7 @@ from langgraph.graph import StateGraph, START, END
 from dart_client import DartClient, DartError, REPRT_CODE
 from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
+from cross_check import run_cross_check, format_cross_check_block
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -61,10 +71,13 @@ class AnalysisState(TypedDict, total=False):
     disclosures: list           # 최근 DART 공시 목록(반복성 공시 제외)
     price: dict                 # 현재가·52주 밴드·PER/PBR·컨센서스 목표주가
     invest_point: dict          # 성장/가치 정량 시그널(invest_point.py 계산)
+    cross_check: dict           # 3단계: 소스 간 교차검증 결과(목표주가/투자의견/밴드 정합성)
     n_chunks: int               # RAG 청크 수
     retrieved_chunks: list      # LLM에 제시한 근거 청크(인용 검증 대상)
     rag_context: str            # 청크들을 [Cxxx] 라벨로 포맷한 컨텍스트
-    citation_report: dict       # 인용 품질 검증 결과
+    citation_report: dict       # 인용 품질 검증 결과(청크 그라운딩)
+    scenario_consistency: dict  # 3단계: 시나리오 방향/파생수치 일관성 검증 결과
+    regenerated: bool           # 1회 자동 재생성이 실제로 발생했는지
     report: str                 # 최종 LLM 리포트
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
     errors: Annotated[list, operator.add]
@@ -232,6 +245,17 @@ def build_invest_point(state: AnalysisState) -> AnalysisState:
     return {"invest_point": ip}
 
 
+def cross_check_sources(state: AnalysisState) -> AnalysisState:
+    """3단계: LLM에게 넘기기 전에 목표주가/투자의견/52주 밴드를 소스 간 교차검증.
+    실제 사고 사례(조회수를 목표주가로 오인)를 데이터 단계에서 잡아내는 게 목적."""
+    try:
+        cc = run_cross_check(price=state.get("price"), fnguide=state.get("fnguide"),
+                             consensus=state.get("consensus"))
+        return {"cross_check": cc}
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "cross_check_sources", e)}
+
+
 # 사업의 내용에서 뽑을 관점들 (각 질의로 관련 청크를 검색)
 _ASPECTS = {
     "핵심이슈": "회사의 최근 핵심 이슈, 업황 변화, 주요 사건과 환경 변화",
@@ -308,61 +332,10 @@ def rag_retrieve(state: AnalysisState) -> AnalysisState:
     return result
 
 
-def analyze(state: AnalysisState) -> AnalysisState:
-    """수집물 -> 이슈/투자포인트 + 낙관/기본/보수 시나리오 초안 (LLM)."""
-    if not state.get("rag_context") and not state.get("financials"):
-        return {"report": "(분석 불가: 사업의 내용/재무 데이터를 확보하지 못했습니다.)"}
-
-    try:
-        from langchain_core.messages import SystemMessage, HumanMessage
-        from llm_backend import get_chat_model
-    except ImportError as e:
-        return {"errors": _append_error(state, "analyze(import)", e),
-                "report": "(LLM 백엔드 모듈/패키지 미설치)"}
-
-    try:
-        llm = get_chat_model(temperature=0.2, max_tokens=2000)
-    except Exception as e:  # noqa: BLE001
-        return {"errors": _append_error(state, "analyze(init)", e),
-                "report": "(LLM 백엔드 초기화 실패 — LLM_BACKEND 설정 확인)"}
-
-    system = (
-        "너는 한국 주식 애널리스트의 리서치 보조다. 아래 '사업보고서 근거 청크'(사업의 "
-        "내용 + 사업의 개요/제품·사업현황 요약 포함), 재무 시계열, 정량 투자포인트(성장/"
-        "가치), 컨센서스, 공시, 뉴스만을 근거로 분석한다. 추론 과정은 출력하지 말고 "
-        "결과만 한국어로 써라. 규칙(엄수):\n"
-        "1) [핵심 이슈][투자포인트][리스크]에서 사업보고서 청크(사업의 내용/사업의 개요/"
-        "제품·사업현황)의 서술 내용에 실제로 근거한 정성적 문장에만, 그 문장 끝에 진짜로 "
-        "관련된 청크 id를 [C012] 형식으로 붙여라. 예: 'DR 시험 이행률이 105%로 높다 "
-        "[C034]'. 인용 없는 정성적 단정 문장은 쓰지 마라. 관련 청크가 없는 정성적 주장은 "
-        "아예 쓰지 마라(숫자 사실은 규칙3 참조).\n"
-        "2) 제공된 '사용 가능 청크 id' 목록에 있는 id만, 그리고 그 청크 내용과 실제로 "
-        "관련된 문장에만 인용하라. 관련 없는 청크 id를 숫자 뒤에 습관적으로 붙이는 것도 "
-        "환각 인용과 같은 수준의 오류다.\n"
-        "3) 금액·비율 숫자(매출·이익·성장률·주가 등)는 [재무 시계열], [연간/분기/예상 실적], "
-        "[투자포인트(정량)]에 실제로 제시된 값만 그대로 쓰고 새로 지어내지 마라. 이 숫자들은 "
-        "사업보고서 청크가 아니라 코드 계산값/공시 수치가 출처이므로 숫자 자체 뒤에는 "
-        "[Cxxx]를 붙이지 마라(출처가 다른데 청크를 붙이면 오히려 오류). 없으면 "
-        "'구체 수치 자료 없음'이라 쓰고 방향(증가/감소/유지)만 기술하라.\n"
-        "4) [성장 시나리오]는 [투자포인트(정량)]의 '성장 판단'과 영업이익 증감률 숫자를 "
-        "그대로(청크 인용 없이) 서술하고, 그 방향을 뒷받침하는 사업보고서상의 정성적 근거"
-        "(증설/수주/신사업 등)가 있으면 별도 문장으로 덧붙이며 그 문장 끝에만 실제 관련 "
-        "청크 id를 붙여라. 관련 청크가 없으면 정성 근거 문장 자체를 쓰지 말고 "
-        "'정성적 근거는 자료상 확인 불가'라고만 써라.\n"
-        "5) [가치 포지션]은 [투자포인트(정량)]의 52주 밴드 위치·가치 시그널 여부를 그대로"
-        "(청크 인용 없이) 서술해 '실적 추정 상승 + 주가 하단 위치'가 동시 성립하는지 "
-        "평가하라. 시그널이 '아니오'인데 있다고 서술하면 심각한 오류다.\n"
-        "6) 근거 청크에 없는 내용은 '자료상 확인 불가'라고 명시하라.\n"
-        "7) 제공된 블록에 없는 파생 수치(YoY%, 배수 등)를 직접 계산해 새로 만들지 마라. "
-        "제공된 숫자만 그대로 쓰고, 시점 비교가 필요하면 '2026.03 대비'처럼 어느 기간 "
-        "대비인지만 서술하되 새 계산값을 만들지 마라.\n"
-        "8) 한 문장 또는 한 항목에는 그 내용과 직접 관련된 청크 id 하나만 붙여라. 여러 "
-        "문장을 이어 쓰고 맨 끝에 인용 하나만 붙이지 마라 — 문장마다 그 문장의 실제 "
-        "근거 청크를 따로 표시하라.\n"
-        "9) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
-        "[컨센서스 대비] [데이터 공백]"
-    )
-
+def _build_prompt_blocks(state: AnalysisState) -> dict:
+    """analyze()가 LLM에 제시하는 구조화 블록들을 만든다. verify_scenario도 같은
+    블록을 '신뢰 가능한 숫자 사전'으로 재사용해(scenario_check.py) 프롬프트 구성과
+    환각 검증이 서로 다른 데이터를 보는 일이 없게 한다."""
     fin = state.get("financials", {})
     fin_lines = []
     for label, d in (("매출액", fin.get("revenue")),
@@ -455,24 +428,109 @@ def analyze(state: AnalysisState) -> AnalysisState:
     ip = state.get("invest_point") or {}
     ip_block = format_invest_point_block(ip) if ip else "(정량 투자포인트 계산 불가)"
 
+    cc = state.get("cross_check") or {}
+    cross_check_block = format_cross_check_block(cc) if cc else "(교차검증 미실행)"
+
     retrieved = state.get("retrieved_chunks") or []
     valid_ids = ", ".join(c["chunk_id"] for c in retrieved) or "(없음)"
+
+    return {
+        "fin_block": fin_block, "news_block": news_block, "cons_block": cons_block,
+        "fng_cons_block": fng_cons_block, "rep_block": rep_block, "est_block": est_block,
+        "discl_block": discl_block, "price_block": price_block, "ip_block": ip_block,
+        "cross_check_block": cross_check_block, "valid_ids": valid_ids,
+    }
+
+
+def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> AnalysisState:
+    """수집물 -> 이슈/투자포인트 + 성장/가치 시나리오 초안 (LLM).
+    feedback이 주어지면(=1회 자동 재생성) 직전 시도에서 발견된 불일치를 콕 집어
+    프롬프트에 덧붙인다."""
+    if not state.get("rag_context") and not state.get("financials"):
+        return {"report": "(분석 불가: 사업의 내용/재무 데이터를 확보하지 못했습니다.)"}
+
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from llm_backend import get_chat_model
+    except ImportError as e:
+        return {"errors": _append_error(state, "analyze(import)", e),
+                "report": "(LLM 백엔드 모듈/패키지 미설치)"}
+
+    try:
+        llm = get_chat_model(temperature=0.2, max_tokens=2000)
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "analyze(init)", e),
+                "report": "(LLM 백엔드 초기화 실패 — LLM_BACKEND 설정 확인)"}
+
+    system = (
+        "너는 한국 주식 애널리스트의 리서치 보조다. 아래 '사업보고서 근거 청크'(사업의 "
+        "내용 + 사업의 개요/제품·사업현황 요약 포함), 재무 시계열, 정량 투자포인트(성장/"
+        "가치), 컨센서스, 공시, 뉴스만을 근거로 분석한다. 추론 과정은 출력하지 말고 "
+        "결과만 한국어로 써라. 규칙(엄수):\n"
+        "1) [핵심 이슈][투자포인트][리스크]에서 사업보고서 청크(사업의 내용/사업의 개요/"
+        "제품·사업현황)의 서술 내용에 실제로 근거한 정성적 문장에만, 그 문장 끝에 진짜로 "
+        "관련된 청크 id를 [C012] 형식으로 붙여라. 예: 'DR 시험 이행률이 105%로 높다 "
+        "[C034]'. 인용 없는 정성적 단정 문장은 쓰지 마라. 관련 청크가 없는 정성적 주장은 "
+        "아예 쓰지 마라(숫자 사실은 규칙3 참조).\n"
+        "2) 제공된 '사용 가능 청크 id' 목록에 있는 id만, 그리고 그 청크 내용과 실제로 "
+        "관련된 문장에만 인용하라. 관련 없는 청크 id를 숫자 뒤에 습관적으로 붙이는 것도 "
+        "환각 인용과 같은 수준의 오류다.\n"
+        "3) 금액·비율 숫자(매출·이익·성장률·주가 등)는 [재무 시계열], [연간/분기/예상 실적], "
+        "[투자포인트(정량)]에 실제로 제시된 값만 그대로 쓰고 새로 지어내지 마라. 이 숫자들은 "
+        "사업보고서 청크가 아니라 코드 계산값/공시 수치가 출처이므로 숫자 자체 뒤에는 "
+        "[Cxxx]를 붙이지 마라(출처가 다른데 청크를 붙이면 오히려 오류). 없으면 "
+        "'구체 수치 자료 없음'이라 쓰고 방향(증가/감소/유지)만 기술하라.\n"
+        "4) [성장 시나리오]는 [투자포인트(정량)]의 '성장 판단'과 영업이익 증감률 숫자를 "
+        "그대로(청크 인용 없이) 서술하고, 그 방향을 뒷받침하는 사업보고서상의 정성적 근거"
+        "(증설/수주/신사업 등)가 있으면 별도 문장으로 덧붙이며 그 문장 끝에만 실제 관련 "
+        "청크 id를 붙여라. 관련 청크가 없으면 정성 근거 문장 자체를 쓰지 말고 "
+        "'정성적 근거는 자료상 확인 불가'라고만 써라.\n"
+        "5) [가치 포지션]은 [투자포인트(정량)]의 52주 밴드 위치·가치 시그널 여부를 그대로"
+        "(청크 인용 없이) 서술해 '실적 추정 상승 + 주가 하단 위치'가 동시 성립하는지 "
+        "평가하라. 시그널이 '아니오'인데 있다고 서술하면 심각한 오류다.\n"
+        "6) 근거 청크에 없는 내용은 '자료상 확인 불가'라고 명시하라.\n"
+        "7) 제공된 블록에 없는 파생 수치(YoY%, 배수 등)를 직접 계산해 새로 만들지 마라. "
+        "제공된 숫자만 그대로 쓰고, 시점 비교가 필요하면 '2026.03 대비'처럼 어느 기간 "
+        "대비인지만 서술하되 새 계산값을 만들지 마라.\n"
+        "8) 한 문장 또는 한 항목에는 그 내용과 직접 관련된 청크 id 하나만 붙여라. 여러 "
+        "문장을 이어 쓰고 맨 끝에 인용 하나만 붙이지 마라 — 문장마다 그 문장의 실제 "
+        "근거 청크를 따로 표시하라.\n"
+        "9) 3단계 교차검증에서 [교차검증]의 어느 항목이 ❌(불일치)면, 그 항목의 숫자는 "
+        "어느 쪽이 맞는지 스스로 판단하지 말고 '소스 간 불일치 — 사람 확인 필요'라고 "
+        "그대로 밝혀라.\n"
+        "10) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
+        "[컨센서스 대비] [데이터 공백]"
+    )
+
+    b = _build_prompt_blocks(state)
+
+    feedback_block = ""
+    if feedback and not feedback.get("consistent", True):
+        problems = "; ".join(feedback.get("problems", [])) or "불일치 발견"
+        feedback_block = (
+            "\n\n[이전 시도 검증 결과 — 반드시 수정]\n"
+            f"직전 답변에서 다음 불일치가 발견되었다: {problems}\n"
+            "[투자포인트(정량)]의 성장 판단/가치 시그널 값과 정확히 같은 방향으로 "
+            "다시 서술하고, 어느 블록에도 없는 파생 수치를 새로 계산해 넣지 마라."
+        )
 
     human = (
         f"종목: {state.get('corp_name')} ({state.get('stock_code')})\n"
         f"근거 공시: {state.get('report_nm')} (접수 {state.get('rcept_dt')})\n\n"
-        f"[재무 시계열(실적, DART)]\n{fin_block}\n\n"
-        f"[연간/분기/예상 실적(FnGuide/WiseReport)]\n{est_block}\n\n"
-        f"[투자포인트(정량) — 성장/가치, 코드 계산값 그대로 인용]\n{ip_block}\n\n"
-        f"[주가/밸류에이션]\n{price_block}\n\n"
-        f"[애널리스트 컨센서스(자체 집계)]\n{cons_block}\n\n"
-        f"[FnGuide/WiseReport 컨센서스]\n{fng_cons_block}\n\n"
-        f"[최근 리포트 목록]\n{rep_block}\n\n"
-        f"[최근 공시]\n{discl_block}\n\n"
-        f"[최근 뉴스]\n{news_block}\n\n"
-        f"[사용 가능 청크 id — 이 중에서만 인용]\n{valid_ids}\n\n"
+        f"[재무 시계열(실적, DART)]\n{b['fin_block']}\n\n"
+        f"[연간/분기/예상 실적(FnGuide/WiseReport)]\n{b['est_block']}\n\n"
+        f"[투자포인트(정량) — 성장/가치, 코드 계산값 그대로 인용]\n{b['ip_block']}\n\n"
+        f"[주가/밸류에이션]\n{b['price_block']}\n\n"
+        f"[교차검증 — 서로 다른 소스 간 정합성]\n{b['cross_check_block']}\n\n"
+        f"[애널리스트 컨센서스(자체 집계)]\n{b['cons_block']}\n\n"
+        f"[FnGuide/WiseReport 컨센서스]\n{b['fng_cons_block']}\n\n"
+        f"[최근 리포트 목록]\n{b['rep_block']}\n\n"
+        f"[최근 공시]\n{b['discl_block']}\n\n"
+        f"[최근 뉴스]\n{b['news_block']}\n\n"
+        f"[사용 가능 청크 id — 이 중에서만 인용]\n{b['valid_ids']}\n\n"
         f"[사업보고서 근거 청크 (이 id만 인용 가능, 사업의 개요/제품·사업현황 포함)]\n"
         f"{state.get('rag_context', '(없음)')}"
+        f"{feedback_block}"
     )
 
     try:
@@ -484,8 +542,21 @@ def analyze(state: AnalysisState) -> AnalysisState:
                 "report": "(LLM 호출 실패)"}
 
 
-def verify_citations(state: AnalysisState) -> AnalysisState:
-    """LLM 리포트의 [Cxxx] 인용이 실재 청크인지 + 근거가 맞는지 검증."""
+def analyze(state: AnalysisState) -> AnalysisState:
+    return _analyze_core(state)
+
+
+def regenerate_analysis(state: AnalysisState) -> AnalysisState:
+    """3단계: scenario_check가 불일치를 발견했을 때 1회만 호출되는 재생성 노드.
+    analyze로 직접 되돌아가는 사이클 대신 별도 노드로 둬서(그래프 조립 참고)
+    '최대 1회'를 구조적으로 보장한다."""
+    result = _analyze_core(state, feedback=state.get("scenario_consistency"))
+    result["regenerated"] = True
+    return result
+
+
+def _verify_citations_core(state: AnalysisState) -> AnalysisState:
+    """LLM 리포트의 [Cxxx] 인용이 실재 청크인지 + 근거가 맞는지 검증(그라운딩)."""
     report = state.get("report", "")
     retrieved = state.get("retrieved_chunks") or []
     if not report or not retrieved:
@@ -500,6 +571,50 @@ def verify_citations(state: AnalysisState) -> AnalysisState:
         return {"citation_report": data}
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "verify_citations", e)}
+
+
+def verify_citations(state: AnalysisState) -> AnalysisState:
+    return _verify_citations_core(state)
+
+
+def verify_citations_2(state: AnalysisState) -> AnalysisState:
+    return _verify_citations_core(state)
+
+
+def _verify_scenario_core(state: AnalysisState) -> AnalysisState:
+    """3단계 2차 검증 레이어: LLM 리포트가 invest_point 시그널과 같은 방향을
+    말하는지 + 제공되지 않은 파생 수치를 지어내지 않았는지(환각 통제)."""
+    report = state.get("report", "")
+    if not report:
+        return {"scenario_consistency": {"consistent": True, "verdict": "(검증 대상 없음)"}}
+    try:
+        import scenario_check
+        blocks = _build_prompt_blocks(state)
+        result = scenario_check.check(report, state.get("invest_point") or {},
+                                      list(blocks.values()))
+        return {"scenario_consistency": result}
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "verify_scenario", e)}
+
+
+def verify_scenario(state: AnalysisState) -> AnalysisState:
+    return _verify_scenario_core(state)
+
+
+def verify_scenario_2(state: AnalysisState) -> AnalysisState:
+    return _verify_scenario_core(state)
+
+
+def _route_after_scenario(state: AnalysisState) -> str:
+    """불일치가 있고 아직 재생성한 적 없으면 딱 1회 regenerate_analysis로,
+    그 외에는 END로. regenerated 플래그로 재귀 방지(사이클이 아니라 별도
+    노드이므로 원래도 1회 이상 못 돌지만, 라우팅 의도를 명시적으로 남긴다)."""
+    sc = state.get("scenario_consistency") or {}
+    if sc.get("consistent", True):
+        return "end"
+    if state.get("regenerated"):
+        return "end"
+    return "regenerate"
 
 
 # ---------------------------------------------------------------------- #
@@ -518,8 +633,13 @@ def build_graph():
     g.add_node("fetch_price", fetch_price)
     g.add_node("fetch_disclosures", fetch_disclosures)
     g.add_node("build_invest_point", build_invest_point)
+    g.add_node("cross_check_sources", cross_check_sources)
     g.add_node("analyze", analyze)
     g.add_node("verify_citations", verify_citations)
+    g.add_node("verify_scenario", verify_scenario)
+    g.add_node("regenerate_analysis", regenerate_analysis)
+    g.add_node("verify_citations_2", verify_citations_2)
+    g.add_node("verify_scenario_2", verify_scenario_2)
 
     g.add_edge(START, "resolve_corp")
     # 사업보고서 체인: 본문(RAG) + 사업의 개요(합성 청크) → rag_retrieve에서 병합 → analyze
@@ -539,13 +659,23 @@ def build_graph():
     g.add_edge("resolve_corp", "fetch_news")
     g.add_edge("resolve_corp", "fetch_research")
     g.add_edge("resolve_corp", "fetch_disclosures")
-    g.add_edge("fetch_financials", "analyze")
     g.add_edge("fetch_news", "analyze")
-    g.add_edge("fetch_research", "analyze")
     g.add_edge("fetch_disclosures", "analyze")
-    # 분석 후 인용 검증
+    # 3단계 교차검증: 목표주가/투자의견/가격밴드를 소스 간 대조 → analyze에도 블록으로 제시
+    g.add_edge("fetch_financials", "cross_check_sources")
+    g.add_edge("fetch_fnguide", "cross_check_sources")
+    g.add_edge("fetch_price", "cross_check_sources")
+    g.add_edge("fetch_research", "cross_check_sources")
+    g.add_edge("cross_check_sources", "analyze")
+    # 분석 → 인용 그라운딩 검증 → 시나리오 일관성/환각 검증
     g.add_edge("analyze", "verify_citations")
-    g.add_edge("verify_citations", END)
+    g.add_edge("verify_citations", "verify_scenario")
+    # 불일치 발견 시 딱 1회만 재생성(사이클 아님 — 전용 노드로 선형 분기)
+    g.add_conditional_edges("verify_scenario", _route_after_scenario,
+                            {"regenerate": "regenerate_analysis", "end": END})
+    g.add_edge("regenerate_analysis", "verify_citations_2")
+    g.add_edge("verify_citations_2", "verify_scenario_2")
+    g.add_edge("verify_scenario_2", END)
     return g.compile()
 
 
@@ -569,6 +699,16 @@ if __name__ == "__main__":
         print("\n--- 정량 투자포인트(성장/가치) ---")
         print(format_invest_point_block(ip))
 
+    cc = result.get("cross_check")
+    if cc:
+        print("\n--- 교차검증(3단계) ---")
+        print(format_cross_check_block(cc))
+        if not cc.get("all_ok", True):
+            print(" ⚠️  소스 간 불일치 발견 — 위 표시된 항목은 사람이 직접 확인하세요.")
+
+    if result.get("regenerated"):
+        print("\n(※ 시나리오 일관성 검증에서 불일치가 발견되어 1회 자동 재생성됨)")
+
     print()
     print(result.get("report", "(리포트 없음)"))
 
@@ -591,6 +731,23 @@ if __name__ == "__main__":
             print(" 근거 미표시 단정:")
             for u in cr["uncited_claim_lines"][:5]:
                 print(f"   - {u}")
+
+    sc = result.get("scenario_consistency", {})
+    if sc and "verdict" in sc:
+        print("\n--- 시나리오 일관성/환각 통제 검증(3단계) ---")
+        print(f" 판정: {sc['verdict']}")
+        if not sc.get("consistent", True):
+            tag = "1회 재생성 후에도 불일치 지속" if result.get("regenerated") else "재생성 미실행"
+            print(f" ⚠️  경고: {tag} — 성장/가치 서술을 정량 시그널과 대조해 수동 확인하세요.")
+        if sc.get("trend_check") and not sc["trend_check"]["match"]:
+            print(f"   - 성장 판단 기대값: {sc['trend_check']['expected']} / "
+                  f"리포트 절: {sc['trend_check']['section'][:80]}")
+        if sc.get("signal_check") and not sc["signal_check"]["match"]:
+            print(f"   - 가치 시그널 기대값: "
+                  f"{'예' if sc['signal_check']['expected'] else '아니오'} / "
+                  f"리포트 절: {sc['signal_check']['section'][:80]}")
+        if sc.get("unverified_numbers"):
+            print(f"   - 미검증 파생수치: {sc['unverified_numbers'][:5]}")
 
     if result.get("errors"):
         print("\n--- 수집/분석 경고 ---")
