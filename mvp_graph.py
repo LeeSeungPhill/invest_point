@@ -44,6 +44,10 @@ import logging
 import operator
 from typing import Annotated, Optional, TypedDict
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from langgraph.graph import StateGraph, START, END
 
 from dart_client import DartClient, DartError, REPRT_CODE

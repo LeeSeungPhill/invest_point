@@ -107,7 +107,7 @@ def chunk_text(text: str, *, max_chars: int = 800, overlap: int = 120) -> list[C
 # ---------------------------------------------------------------------- #
 class OllamaEmbedder:
     def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None,
-                 timeout: int = 60):
+                 timeout: int = 120):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
         self.base = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
         self.timeout = timeout
