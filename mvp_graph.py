@@ -14,6 +14,11 @@ mvp_graph.py
        과거 분석 결과를 PostgreSQL에 저장·조회해(analysis_history.py) LLM이
        '지난 분석 대비' 서술을 실제 과거 숫자로만 하게 하고, 근거 수치는 그대로인데
        판단만 뒤집힌 경우를 참고 신호(history_drift)로 남긴다.
+4단계: 컨센서스(자체 집계 + FnGuide, 코드 계산값)와 3단계에서 검증까지 끝난 LLM
+       리포트의 정성 절([투자포인트]/[가치 포지션]/[컨센서스 대비])을 하나로 묶어
+       '투자포인트 요약'을 만든다(build_investment_summary). 새 숫자를 만들지 않고
+       이미 검증된 컨센서스 수치 + 리포트 문장을 재구성만 하므로 추가 LLM 호출이나
+       환각 위험이 없다. 결과는 analysis_history에도 함께 저장된다.
 
 설계 원칙(앞선 검토와 일관):
   - LLM에게 매출을 '포인트 숫자'로 예측시키지 않는다.
@@ -38,6 +43,7 @@ mvp_graph.py
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import logging
@@ -89,6 +95,7 @@ class AnalysisState(TypedDict, total=False):
     history: list               # 3단계: 같은 종목의 과거 분석 이력(최신순, PostgreSQL)
     history_drift: dict         # 3단계: 과거 대비 '근거 수치는 그대로인데 판단만 뒤집힘' 참고신호
     report: str                 # 최종 LLM 리포트
+    investment_summary: str     # 4단계: 컨센서스 + 리포트 결합 투자포인트 요약
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
     errors: Annotated[list, operator.add]
     sources_status: Annotated[dict, lambda a, b: {**(a or {}), **(b or {})}]
@@ -292,10 +299,65 @@ def save_history(state: AnalysisState) -> AnalysisState:
             citation_report=state.get("citation_report"), cross_check=state.get("cross_check"),
             scenario_consistency=state.get("scenario_consistency"),
             regenerated=bool(state.get("regenerated")), report=state.get("report"),
+            investment_summary=state.get("investment_summary"),
         )
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
     return {}
+
+
+def _extract_report_section(report: str, tag: str) -> str:
+    """LLM 리포트 텍스트에서 '[tag] ... (다음 [절 제목] 전까지)' 절만 추출.
+    본문 안의 인용 표시([C012] 등)는 다음 절의 시작으로 오인하면 안 되므로,
+    다음 구분자는 '[C123]' 형태가 아닌 대괄호만 절 경계로 인정한다."""
+    if not report:
+        return ""
+    m = re.search(rf"\[{re.escape(tag)}\](.*?)(?=\[(?!C\d)[^\[\]]+\]|$)", report, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def build_investment_summary(state: AnalysisState) -> AnalysisState:
+    """4단계: 컨센서스(목표주가/투자의견 — 코드 계산값)와 3단계 검증을 거친 LLM
+    리포트의 정성 절([투자포인트]/[가치 포지션]/[컨센서스 대비])을 묶어 한 번에
+    보는 '투자포인트 요약'을 만든다. 여기서는 새 숫자를 만들지 않고 이미 만들어진
+    컨센서스 수치 + 검증된 리포트 문장만 재구성한다(추가 LLM 호출 없음)."""
+    report = state.get("report") or ""
+    cons = state.get("consensus") or {}
+    fng_cons = (state.get("fnguide") or {}).get("consensus") or {}
+    ip = state.get("invest_point") or {}
+    growth = ip.get("growth") or {}
+    valuation = ip.get("valuation") or {}
+
+    lines = []
+    if cons.get("n_target_prices"):
+        lines.append(
+            f"- 컨센서스(자체 집계 {cons['n_target_prices']}건): 목표주가 평균 "
+            f"{cons.get('target_price_mean'):,} / 중앙값 {cons.get('target_price_median'):,}, "
+            f"투자의견 {cons.get('opinion_distribution') or '자료 부족'}"
+        )
+    elif fng_cons.get("target_price") or fng_cons.get("opinion_label"):
+        lines.append(
+            f"- 컨센서스(FnGuide): 목표주가 {fng_cons.get('target_price') or '자료 없음'}, "
+            f"투자의견 {fng_cons.get('opinion_label') or '자료 없음'}"
+        )
+    else:
+        lines.append("- 컨센서스: 자료상 확인 불가")
+
+    if valuation.get("target_upside_pct") is not None:
+        lines.append(f"- 목표주가 대비 상승여력: {valuation['target_upside_pct']}%")
+    lines.append(f"- 성장 판단(정량): {growth.get('trend') or '자료상 확인 불가'}")
+    lines.append(f"- 가치 시그널(정량, 실적상승+주가하단 동시충족): "
+                f"{'예' if valuation.get('signal') else '아니오'}")
+
+    for tag in ("투자포인트", "가치 포지션", "컨센서스 대비"):
+        section = _extract_report_section(report, tag)
+        if section:
+            lines.append(f"\n[{tag}]\n{section}")
+
+    if not report:
+        lines.append("\n(리포트 미생성 — 정량 컨센서스만 반영)")
+
+    return {"investment_summary": "\n".join(lines)}
 
 
 # 사업의 내용에서 뽑을 관점들 (각 질의로 관련 청크를 검색)
@@ -701,6 +763,10 @@ def build_graph():
     g.add_node("regenerate_analysis", regenerate_analysis)
     g.add_node("verify_citations_2", verify_citations_2)
     g.add_node("verify_scenario_2", verify_scenario_2)
+    # 4단계: 두 종료 경로 각각 전용 노드 인스턴스로 분리(save_history와 동일한 이유 —
+    # 공유 노드는 두 경로에서 두 번 실행되는 문제가 실측 확인됨).
+    g.add_node("build_summary", build_investment_summary)
+    g.add_node("build_summary_2", build_investment_summary)
     # save_history를 두 종료 경로가 공유하면 LangGraph가 노드를 두 번(각 경로당
     # 한 번씩) 실행해 DB에 중복 저장하는 문제가 실측 확인됨 — verify_citations와
     # 동일하게 경로별 전용 노드 인스턴스로 분리해 각 경로가 정확히 1회만 저장하게 한다.
@@ -741,12 +807,14 @@ def build_graph():
     g.add_edge("verify_citations", "verify_scenario")
     # 불일치 발견 시 딱 1회만 재생성(사이클 아님 — 전용 노드로 선형 분기)
     g.add_conditional_edges("verify_scenario", _route_after_scenario,
-                            {"regenerate": "regenerate_analysis", "end": "save_history"})
+                            {"regenerate": "regenerate_analysis", "end": "build_summary"})
     g.add_edge("regenerate_analysis", "verify_citations_2")
     g.add_edge("verify_citations_2", "verify_scenario_2")
-    # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 전용 저장 노드를 거쳐 END로
+    # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 4단계 요약 → 저장 노드를 거쳐 END로
+    g.add_edge("build_summary", "save_history")
     g.add_edge("save_history", END)
-    g.add_edge("verify_scenario_2", "save_history_2")
+    g.add_edge("verify_scenario_2", "build_summary_2")
+    g.add_edge("build_summary_2", "save_history_2")
     g.add_edge("save_history_2", END)
     return g.compile()
 
@@ -793,6 +861,11 @@ if __name__ == "__main__":
 
     print()
     print(result.get("report", "(리포트 없음)"))
+
+    inv_summary = result.get("investment_summary")
+    if inv_summary:
+        print("\n--- 4단계: 컨센서스+리포트 결합 투자포인트 요약 ---")
+        print(inv_summary)
 
     cr = result.get("citation_report", {})
     if cr and "verdict" in cr:

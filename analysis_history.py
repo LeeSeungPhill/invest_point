@@ -11,6 +11,9 @@ analysis_history.py
     가치 시그널)만 뒤집힌' 경우를 잡아 참고 신호로 남긴다. 단, 과거 이력은 이번
     실행의 직접 근거가 아니므로 자동 재생성(regenerate) 트리거로는 쓰지 않는다
     — scenario_check.py의 '단일 실행 내 일관성' 검증과 역할을 분리한다.
+  - investment_summary 컬럼: 4단계(mvp_graph.build_investment_summary)가 만든
+    '컨센서스+리포트 결합 투자포인트 요약'을 그대로 저장해, 주간 배치 등에서
+    리포트 전문 없이도 이 컬럼만 훑어 종목별 투자포인트를 빠르게 확인할 수 있다.
 
 접속정보(.env): PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD.
 DISABLE_HISTORY=1 로 저장/조회를 모두 끌 수 있다(DB 접속 불가 환경 대비).
@@ -48,9 +51,11 @@ CREATE TABLE IF NOT EXISTS analysis_history (
     cross_check_ok BOOLEAN,
     scenario_verdict TEXT,
     regenerated BOOLEAN,
-    report TEXT
+    report TEXT,
+    investment_summary TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hist_stock_time ON analysis_history(stock_code, run_at DESC);
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS investment_summary TEXT;
 """
 
 
@@ -80,7 +85,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             invest_point: Optional[dict] = None, price: Optional[dict] = None,
             citation_report: Optional[dict] = None, cross_check: Optional[dict] = None,
             scenario_consistency: Optional[dict] = None, regenerated: bool = False,
-            report: Optional[str] = None) -> None:
+            report: Optional[str] = None,
+            investment_summary: Optional[str] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
@@ -95,8 +101,9 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                 """INSERT INTO analysis_history
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
-                    citation_verdict, cross_check_ok, scenario_verdict, regenerated, report)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    citation_verdict, cross_check_ok, scenario_verdict, regenerated, report,
+                    investment_summary)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
                  bool(valuation.get("signal")), valuation.get("band_position"),
@@ -104,9 +111,28 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  (citation_report or {}).get("verdict"),
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
-                 bool(regenerated), report),
+                 bool(regenerated), report, investment_summary),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def list_distinct_stocks() -> list[dict]:
+    """이력에 한 번이라도 저장된 전 종목(중복 제거, 종목코드순).
+    주간 배치(weekly_batch.py)가 분석 대상 종목 목록을 얻는 용도."""
+    if not is_enabled():
+        return []
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT stock_code, MAX(corp_name) AS corp_name FROM analysis_history "
+                "GROUP BY stock_code ORDER BY stock_code"
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
