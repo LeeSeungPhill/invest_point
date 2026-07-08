@@ -10,7 +10,10 @@ mvp_graph.py
        LLM에게 넘어가는 것을 막고, 분석 '후' LLM 리포트가 invest_point 시그널과
        실제로 같은 방향을 말하는지 + 제공되지 않은 파생 수치를 지어내지 않았는지
        검증(scenario_check.py)한다. 불일치 발견 시 1회 자동 재생성 후 그래도
-       남아있으면 최종 결과에 경고를 남긴다(무한 재시도 금지).
+       남아있으면 최종 결과에 경고를 남긴다(무한 재시도 금지). 또한 같은 종목의
+       과거 분석 결과를 PostgreSQL에 저장·조회해(analysis_history.py) LLM이
+       '지난 분석 대비' 서술을 실제 과거 숫자로만 하게 하고, 근거 수치는 그대로인데
+       판단만 뒤집힌 경우를 참고 신호(history_drift)로 남긴다.
 
 설계 원칙(앞선 검토와 일관):
   - LLM에게 매출을 '포인트 숫자'로 예측시키지 않는다.
@@ -47,6 +50,7 @@ from dart_client import DartClient, DartError, REPRT_CODE
 from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
 from cross_check import run_cross_check, format_cross_check_block
+import analysis_history
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -78,6 +82,8 @@ class AnalysisState(TypedDict, total=False):
     citation_report: dict       # 인용 품질 검증 결과(청크 그라운딩)
     scenario_consistency: dict  # 3단계: 시나리오 방향/파생수치 일관성 검증 결과
     regenerated: bool           # 1회 자동 재생성이 실제로 발생했는지
+    history: list               # 3단계: 같은 종목의 과거 분석 이력(최신순, PostgreSQL)
+    history_drift: dict         # 3단계: 과거 대비 '근거 수치는 그대로인데 판단만 뒤집힘' 참고신호
     report: str                 # 최종 LLM 리포트
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
     errors: Annotated[list, operator.add]
@@ -256,6 +262,38 @@ def cross_check_sources(state: AnalysisState) -> AnalysisState:
         return {"errors": _append_error(state, "cross_check_sources", e)}
 
 
+def load_history(state: AnalysisState) -> AnalysisState:
+    """3단계: 같은 종목의 과거 분석 이력(PostgreSQL)을 불러와 analyze 프롬프트에
+    참조 자료로 제공한다. DB 접속 불가 시에도 그래프는 계속 진행(빈 이력 취급)."""
+    if not state.get("stock_code"):
+        return {"sources_status": {"history": "skip"}}
+    if not analysis_history.is_enabled():
+        return {"sources_status": {"history": "off"}}
+    try:
+        hist = analysis_history.get_recent(state["stock_code"], limit=5)
+        return {"history": hist, "sources_status": {"history": "ok" if hist else "empty"}}
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "load_history", e),
+                "sources_status": {"history": "error"}}
+
+
+def save_history(state: AnalysisState) -> AnalysisState:
+    """3단계: 이번 실행의 핵심 결과를 다음 분석이 참조할 수 있도록 저장.
+    두 종료 경로(재생성 없음 / 1회 재생성 후) 모두 이 노드를 거쳐 END로 간다."""
+    try:
+        analysis_history.save_run(
+            stock_code=state.get("stock_code"), corp_name=state.get("corp_name"),
+            report_nm=state.get("report_nm"), rcept_dt=state.get("rcept_dt"),
+            invest_point=state.get("invest_point"), price=state.get("price"),
+            citation_report=state.get("citation_report"), cross_check=state.get("cross_check"),
+            scenario_consistency=state.get("scenario_consistency"),
+            regenerated=bool(state.get("regenerated")), report=state.get("report"),
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "save_history", e)}
+    return {}
+
+
 # 사업의 내용에서 뽑을 관점들 (각 질의로 관련 청크를 검색)
 _ASPECTS = {
     "핵심이슈": "회사의 최근 핵심 이슈, 업황 변화, 주요 사건과 환경 변화",
@@ -431,6 +469,10 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
     cc = state.get("cross_check") or {}
     cross_check_block = format_cross_check_block(cc) if cc else "(교차검증 미실행)"
 
+    history = state.get("history") or []
+    history_block = analysis_history.format_history_block(history)
+    history_drift = analysis_history.check_drift(ip, history) if history else None
+
     retrieved = state.get("retrieved_chunks") or []
     valid_ids = ", ".join(c["chunk_id"] for c in retrieved) or "(없음)"
 
@@ -438,7 +480,8 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
         "fin_block": fin_block, "news_block": news_block, "cons_block": cons_block,
         "fng_cons_block": fng_cons_block, "rep_block": rep_block, "est_block": est_block,
         "discl_block": discl_block, "price_block": price_block, "ip_block": ip_block,
-        "cross_check_block": cross_check_block, "valid_ids": valid_ids,
+        "cross_check_block": cross_check_block, "history_block": history_block,
+        "history_drift": history_drift, "valid_ids": valid_ids,
     }
 
 
@@ -498,7 +541,11 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         "9) 3단계 교차검증에서 [교차검증]의 어느 항목이 ❌(불일치)면, 그 항목의 숫자는 "
         "어느 쪽이 맞는지 스스로 판단하지 말고 '소스 간 불일치 — 사람 확인 필요'라고 "
         "그대로 밝혀라.\n"
-        "10) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
+        "10) [컨센서스 대비]에서 과거와 비교하려면 [과거 분석 이력]에 실제로 적힌 "
+        "날짜·수치만 근거로 '지난 분석(YYYY-MM-DD) 대비 개선/악화' 식으로 서술하라. "
+        "이력이 없거나('과거 분석 이력 없음') 비교할 수치가 없으면 비교 서술 자체를 "
+        "하지 말고 '과거 이력 없음'이라고만 써라 — 이력에 없는 추세를 지어내지 마라.\n"
+        "11) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
         "[컨센서스 대비] [데이터 공백]"
     )
 
@@ -522,6 +569,7 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         f"[투자포인트(정량) — 성장/가치, 코드 계산값 그대로 인용]\n{b['ip_block']}\n\n"
         f"[주가/밸류에이션]\n{b['price_block']}\n\n"
         f"[교차검증 — 서로 다른 소스 간 정합성]\n{b['cross_check_block']}\n\n"
+        f"[과거 분석 이력 — 최신순, 이 안의 날짜·수치만 비교에 사용 가능]\n{b['history_block']}\n\n"
         f"[애널리스트 컨센서스(자체 집계)]\n{b['cons_block']}\n\n"
         f"[FnGuide/WiseReport 컨센서스]\n{b['fng_cons_block']}\n\n"
         f"[최근 리포트 목록]\n{b['rep_block']}\n\n"
@@ -536,7 +584,8 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
     try:
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
         return {"report": resp.content if isinstance(resp.content, str)
-                else str(resp.content)}
+                else str(resp.content),
+                "history_drift": b.get("history_drift")}
     except Exception as e:  # noqa: BLE001  (네트워크/키 등 광범위)
         return {"errors": _append_error(state, "analyze(llm)", e),
                 "report": "(LLM 호출 실패)"}
@@ -590,8 +639,8 @@ def _verify_scenario_core(state: AnalysisState) -> AnalysisState:
     try:
         import scenario_check
         blocks = _build_prompt_blocks(state)
-        result = scenario_check.check(report, state.get("invest_point") or {},
-                                      list(blocks.values()))
+        text_blocks = [v for v in blocks.values() if isinstance(v, str)]
+        result = scenario_check.check(report, state.get("invest_point") or {}, text_blocks)
         return {"scenario_consistency": result}
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "verify_scenario", e)}
@@ -634,12 +683,25 @@ def build_graph():
     g.add_node("fetch_disclosures", fetch_disclosures)
     g.add_node("build_invest_point", build_invest_point)
     g.add_node("cross_check_sources", cross_check_sources)
-    g.add_node("analyze", analyze)
+    g.add_node("load_history", load_history)
+    # analyze는 서로 다른 홉 깊이의 가지(1홉: fetch_news/fetch_disclosures/load_history,
+    # 2홉: rag_retrieve/build_invest_point/cross_check_sources)가 합류하는 지점이다.
+    # LangGraph는 기본적으로 이런 비대칭 fan-in에서 먼저 도착한 얕은 가지들만으로
+    # 노드를 한 번 실행한 뒤, 늦게 도착한 깊은 가지가 채워지면 다시 한 번 더
+    # 실행한다(실측 확인 — analyze가 LLM을 두 번 호출하고 save_history가 행을
+    # 두 번 쓰는 원인이었음). defer=True로 '이 실행에 남은 다른 작업이 없을 때까지'
+    # 대기시켜 정확히 1회만 실행되게 한다.
+    g.add_node("analyze", analyze, defer=True)
     g.add_node("verify_citations", verify_citations)
     g.add_node("verify_scenario", verify_scenario)
     g.add_node("regenerate_analysis", regenerate_analysis)
     g.add_node("verify_citations_2", verify_citations_2)
     g.add_node("verify_scenario_2", verify_scenario_2)
+    # save_history를 두 종료 경로가 공유하면 LangGraph가 노드를 두 번(각 경로당
+    # 한 번씩) 실행해 DB에 중복 저장하는 문제가 실측 확인됨 — verify_citations와
+    # 동일하게 경로별 전용 노드 인스턴스로 분리해 각 경로가 정확히 1회만 저장하게 한다.
+    g.add_node("save_history", save_history)
+    g.add_node("save_history_2", save_history)
 
     g.add_edge(START, "resolve_corp")
     # 사업보고서 체인: 본문(RAG) + 사업의 개요(합성 청크) → rag_retrieve에서 병합 → analyze
@@ -667,15 +729,21 @@ def build_graph():
     g.add_edge("fetch_price", "cross_check_sources")
     g.add_edge("fetch_research", "cross_check_sources")
     g.add_edge("cross_check_sources", "analyze")
+    # 3단계 이력: 같은 종목의 과거 분석을 불러와 analyze에 참조 자료로 제공
+    g.add_edge("resolve_corp", "load_history")
+    g.add_edge("load_history", "analyze")
     # 분석 → 인용 그라운딩 검증 → 시나리오 일관성/환각 검증
     g.add_edge("analyze", "verify_citations")
     g.add_edge("verify_citations", "verify_scenario")
     # 불일치 발견 시 딱 1회만 재생성(사이클 아님 — 전용 노드로 선형 분기)
     g.add_conditional_edges("verify_scenario", _route_after_scenario,
-                            {"regenerate": "regenerate_analysis", "end": END})
+                            {"regenerate": "regenerate_analysis", "end": "save_history"})
     g.add_edge("regenerate_analysis", "verify_citations_2")
     g.add_edge("verify_citations_2", "verify_scenario_2")
-    g.add_edge("verify_scenario_2", END)
+    # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 전용 저장 노드를 거쳐 END로
+    g.add_edge("save_history", END)
+    g.add_edge("verify_scenario_2", "save_history_2")
+    g.add_edge("save_history_2", END)
     return g.compile()
 
 
@@ -705,6 +773,16 @@ if __name__ == "__main__":
         print(format_cross_check_block(cc))
         if not cc.get("all_ok", True):
             print(" ⚠️  소스 간 불일치 발견 — 위 표시된 항목은 사람이 직접 확인하세요.")
+
+    hist = result.get("history")
+    print("\n--- 과거 분석 이력(3단계) ---")
+    print(analysis_history.format_history_block(hist or []))
+    drift = result.get("history_drift")
+    if drift:
+        print(f" ⚠️  과거({drift['prev_run_at']}) 대비 근거 수치는 유지되는데 판단만 "
+              f"바뀐 항목이 있습니다:")
+        for f in drift["flips"]:
+            print(f"   - {f}")
 
     if result.get("regenerated"):
         print("\n(※ 시나리오 일관성 검증에서 불일치가 발견되어 1회 자동 재생성됨)")

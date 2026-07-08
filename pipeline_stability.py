@@ -27,7 +27,7 @@ from mvp_graph import run
 
 DEFAULT = ["005930", "000660", "112610", "035420", "247540"]
 SOURCES = ["dart_business", "dart_financials", "news", "research", "fnguide",
-          "price", "disclosures", "biz_summary", "rag"]
+          "price", "disclosures", "biz_summary", "rag", "history"]
 
 
 def main(codes: list[str]):

@@ -6,6 +6,7 @@ beautifulsoup4>=4.12
 numpy>=1.26
 pandas>=2.0
 lxml>=5.0
+psycopg2-binary>=2.9   # 3단계 analysis_history.py (PostgreSQL 이력 저장)
 
 # --- LLM 백엔드는 택1 (LLM_BACKEND 환경변수로 선택) ---
 # 로컬 Ollama (기본, 키·비용 없음):
