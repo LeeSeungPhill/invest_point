@@ -118,25 +118,6 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
         conn.close()
 
 
-def list_distinct_stocks() -> list[dict]:
-    """이력에 한 번이라도 저장된 전 종목(중복 제거, 종목코드순).
-    주간 배치(weekly_batch.py)가 분석 대상 종목 목록을 얻는 용도."""
-    if not is_enabled():
-        return []
-    conn = _connect()
-    try:
-        _ensure_schema(conn)
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT stock_code, MAX(corp_name) AS corp_name FROM analysis_history "
-                "GROUP BY stock_code ORDER BY stock_code"
-            )
-            rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
 def get_recent(stock_code: str, *, limit: int = 5) -> list[dict]:
     """가장 최근 것부터. history[0]가 직전 실행."""
     if not is_enabled() or not stock_code:
