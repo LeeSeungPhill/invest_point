@@ -452,6 +452,10 @@ def _xml_to_text(doc: str) -> str:
     return doc.strip()
 
 
+_SECTION_START_RE = re.compile(r"(?:^|\n)[ \t]*(?:I{1,3}\.\s*)?(사업의\s*내용)[ \t]*(?:\n|$)")
+_SECTION_END_RE = re.compile(r"(?:^|\n)[ \t]*(?:I{1,3}\.\s*)?(재무에\s*관한\s*사항)[ \t]*(?:\n|$)")
+
+
 def _slice_business_section(text: str) -> str:
     """'사업의 내용' 시작 ~ '재무에 관한 사항' 시작 구간을 잘라낸다.
 
@@ -459,9 +463,16 @@ def _slice_business_section(text: str) -> str:
     가장 긴 구간(=실제 본문)을 택하는 휴리스틱을 쓴다.
     기업/연도별로 소제목 체계가 제각각이라 본문 전체를 통으로 넘기고
     세부 분류는 상위 LLM 노드에 맡긴다.
-    """
-    starts = [m.start() for m in re.finditer(r"사업의\s*내용", text)]
-    ends = [m.start() for m in re.finditer(r"재무에\s*관한\s*사항", text)]
+
+    실측 버그: 본문 중 각주성 참조("...종속회사는 III. 재무에 관한 사항 - 3.
+    연결재무제표 주석...을 참고하시기 바랍니다")가 문장 중간에 낀 채로 '재무에
+    관한 사항'을 포함하고 있으면, 이걸 진짜 章 경계로 오인해 본문이 몇 줄만에
+    잘려나간다(예: 하이브 352820 — 본문이 1,746자로 잘려 RAG 청크가 3개뿐).
+    실제 章 제목은 항상 그 줄에 그 문구만 단독으로 나오므로(앞뒤에 다른 문장
+    없이 줄바꿈), '줄 전체가 그 헤더뿐'인 경우만 경계로 인정해 각주 참조를
+    걸러낸다."""
+    starts = [m.start(1) for m in _SECTION_START_RE.finditer(text)]
+    ends = [m.start(1) for m in _SECTION_END_RE.finditer(text)]
 
     if not starts:
         # 헤더를 못 찾으면 빈 문자열 대신 앞부분이라도 반환하지 않고 신호를 준다.

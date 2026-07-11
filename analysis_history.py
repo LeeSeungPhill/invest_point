@@ -185,15 +185,23 @@ def check_drift(current_ip: dict, history: list[dict]) -> Optional[dict]:
             flips.append(f"성장 판단 {prev_trend}→{cur_trend} "
                         f"(증감률 부호는 유지: {prev_yoy}%→{cur_yoy}%)")
 
+    # 가치 시그널 = est_rising(영업이익 증감률 부호) AND is_low_band(밴드위치).
+    # 실측 오탐: 밴드위치만 안 바뀐 걸 확인하고 '근거 그대론데 판단만 바뀜'이라
+    # 경고했는데, 실제로는 op_yoy_forward가 부호를 바꿔서(-3.3%→+1.2%) 시그널이
+    # 뒤집힌 정당한 경우였다. 두 입력(밴드위치, 증감률 부호) 다 안 바뀐 경우에만
+    # '근거 그대론데 판단만 바뀜'으로 본다.
     prev_signal, cur_signal = prev.get("value_signal"), valuation.get("signal")
     prev_band, cur_band = prev.get("band_position"), valuation.get("band_position")
     if (prev_signal is not None and cur_signal is not None
             and bool(prev_signal) != bool(cur_signal)
             and prev_band is not None and cur_band is not None
-            and abs(prev_band - cur_band) < 0.05):
+            and abs(prev_band - cur_band) < 0.05
+            and prev_yoy is not None and cur_yoy is not None
+            and (prev_yoy > 0) == (cur_yoy > 0)):
         flips.append(f"가치 시그널 {'예' if prev_signal else '아니오'}→"
                     f"{'예' if cur_signal else '아니오'} "
-                    f"(밴드위치는 거의 그대로: {prev_band*100:.1f}%→{cur_band*100:.1f}%)")
+                    f"(밴드위치·영업이익증감률 부호 모두 거의 그대로: "
+                    f"{prev_band*100:.1f}%→{cur_band*100:.1f}%, {prev_yoy}%→{cur_yoy}%)")
 
     if not flips:
         return None

@@ -60,6 +60,7 @@ from dart_client import DartClient, DartError, REPRT_CODE
 from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
 from cross_check import run_cross_check, format_cross_check_block
+from scenario_check import SECTION_TAGS
 import analysis_history
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
@@ -306,13 +307,19 @@ def save_history(state: AnalysisState) -> AnalysisState:
     return {}
 
 
+_SECTION_TAG_ALT = "|".join(re.escape(t) for t in SECTION_TAGS)
+
+
 def _extract_report_section(report: str, tag: str) -> str:
-    """LLM 리포트 텍스트에서 '[tag] ... (다음 [절 제목] 전까지)' 절만 추출.
-    본문 안의 인용 표시([C012] 등)는 다음 절의 시작으로 오인하면 안 되므로,
-    다음 구분자는 '[C123]' 형태가 아닌 대괄호만 절 경계로 인정한다."""
+    """LLM 리포트 텍스트에서 '[tag] ... (다음 절 제목 전까지)' 절만 추출.
+    system 프롬프트가 정의한 실제 절 제목(SECTION_TAGS)만 절 경계로 인정한다.
+    LLM이 본문 중간에 '[C012]'나 '[투자포인트(정량)]' 같은 인용/유사인용 태그를
+    붙이는 경우 이를 절 경계로 오인하면 뒤 문장이 통째로 잘려나가는 버그가 있었다
+    (예: [가치 포지션]의 핵심 결론 문장이 중간의 '[투자포인트(정량)]' 태그 때문에
+    검증 대상에서 누락된 실사례 — scenario_check.py의 동일 버그와 함께 수정)."""
     if not report:
         return ""
-    m = re.search(rf"\[{re.escape(tag)}\](.*?)(?=\[(?!C\d)[^\[\]]+\]|$)", report, re.S)
+    m = re.search(rf"\[{re.escape(tag)}\](.*?)(?=\[(?:{_SECTION_TAG_ALT})\]|$)", report, re.S)
     return m.group(1).strip() if m else ""
 
 
@@ -354,8 +361,12 @@ def build_investment_summary(state: AnalysisState) -> AnalysisState:
         if section:
             lines.append(f"\n[{tag}]\n{section}")
 
-    if not report:
-        lines.append("\n(리포트 미생성 — 정량 컨센서스만 반영)")
+    # analyze() 실패 시 report는 빈 문자열이 아니라 "(...)" 플레이스홀더로 채워진다
+    # (데이터 부족/LLM 호출 실패/빈 응답). 두 경우 모두 실제 절이 하나도 안 뽑혔을
+    # 것이므로, '리포트 미생성'임을 명확히 표시한다(조용히 정량 요약만 보여주면
+    # 실패를 정상 결과처럼 오인하기 쉽다).
+    if not report or report.strip().startswith("("):
+        lines.append(f"\n(리포트 미생성 — 정량 컨센서스만 반영: {report or '리포트 없음'})")
 
     return {"investment_summary": "\n".join(lines)}
 
@@ -566,7 +577,10 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
                 "report": "(LLM 백엔드 모듈/패키지 미설치)"}
 
     try:
-        llm = get_chat_model(temperature=0.2, max_tokens=2000)
+        # qwen3 등 'thinking' 모델은 내부 추론에 토큰을 상당히 쓰므로(특히 피드백
+        # 블록이 붙는 재생성 시도), 2000으로는 최종 답변이 빈 문자열로 잘리는 경우가
+        # 실측됐다. 4000으로 여유를 둔다(그래도 비면 위의 빈 응답 처리가 잡아준다).
+        llm = get_chat_model(temperature=0.2, max_tokens=4000)
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "analyze(init)", e),
                 "report": "(LLM 백엔드 초기화 실패 — LLM_BACKEND 설정 확인)"}
@@ -580,23 +594,33 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         "제품·사업현황)의 서술 내용에 실제로 근거한 정성적 문장에만, 그 문장 끝에 진짜로 "
         "관련된 청크 id를 [C012] 형식으로 붙여라. 예: 'DR 시험 이행률이 105%로 높다 "
         "[C034]'. 인용 없는 정성적 단정 문장은 쓰지 마라. 관련 청크가 없는 정성적 주장은 "
-        "아예 쓰지 마라(숫자 사실은 규칙3 참조).\n"
+        "아예 쓰지 마라(숫자 사실은 규칙3 참조). 매출/이익 증감을 말할 때는 반드시 어느 "
+        "기간과 비교한 것인지 명시하라(예: '직전분기 대비 감소', '2026년(E) 대비 증가'). "
+        "과거 실적은 부진했지만 예상 실적은 개선되는 경우(저점 통과) 두 서술이 방향은 "
+        "달라도 정상이다 — 문제는 방향이 다른 게 아니라 기간을 명시하지 않아 어느 쪽 "
+        "얘기인지 불분명한 것이니, 기간을 항상 같이 써서 모호함을 없애라.\n"
         "2) 제공된 '사용 가능 청크 id' 목록에 있는 id만, 그리고 그 청크 내용과 실제로 "
         "관련된 문장에만 인용하라. 관련 없는 청크 id를 숫자 뒤에 습관적으로 붙이는 것도 "
         "환각 인용과 같은 수준의 오류다.\n"
-        "3) 금액·비율 숫자(매출·이익·성장률·주가 등)는 [재무 시계열], [연간/분기/예상 실적], "
-        "[투자포인트(정량)]에 실제로 제시된 값만 그대로 쓰고 새로 지어내지 마라. 이 숫자들은 "
+        "3) 금액·비율 숫자(매출·이익·성장률·주가 등)는 투자포인트 정량 데이터, 재무 시계열, "
+        "연간/분기/예상 실적에 실제로 제시된 값만 그대로 쓰고 새로 지어내지 마라. 이 숫자들은 "
         "사업보고서 청크가 아니라 코드 계산값/공시 수치가 출처이므로 숫자 자체 뒤에는 "
-        "[Cxxx]를 붙이지 마라(출처가 다른데 청크를 붙이면 오히려 오류). 없으면 "
-        "'구체 수치 자료 없음'이라 쓰고 방향(증가/감소/유지)만 기술하라.\n"
-        "4) [성장 시나리오]는 [투자포인트(정량)]의 '성장 판단'과 영업이익 증감률 숫자를 "
-        "그대로(청크 인용 없이) 서술하고, 그 방향을 뒷받침하는 사업보고서상의 정성적 근거"
+        "어떤 대괄호 표시도 붙이지 마라(청크 인용 [Cxxx]도, 블록 이름을 흉내 낸 다른 "
+        "대괄호 태그도 금지 — 예를 들어 '[투자포인트(정량)]'처럼 데이터 블록 제목을 "
+        "그대로 따와 문장 끝에 붙이는 것은 실재하지 않는 인용을 만드는 것과 같은 오류다). "
+        "없으면 '구체 수치 자료 없음'이라 쓰고 방향(증가/감소/유지)만 기술하라.\n"
+        "4) [성장 시나리오]는 투자포인트 정량 데이터의 '성장 판단'과 영업이익 증감률 숫자를 "
+        "그대로(대괄호 태그 없이) 서술하고, 그 방향을 뒷받침하는 사업보고서상의 정성적 근거"
         "(증설/수주/신사업 등)가 있으면 별도 문장으로 덧붙이며 그 문장 끝에만 실제 관련 "
         "청크 id를 붙여라. 관련 청크가 없으면 정성 근거 문장 자체를 쓰지 말고 "
         "'정성적 근거는 자료상 확인 불가'라고만 써라.\n"
-        "5) [가치 포지션]은 [투자포인트(정량)]의 52주 밴드 위치·가치 시그널 여부를 그대로"
-        "(청크 인용 없이) 서술해 '실적 추정 상승 + 주가 하단 위치'가 동시 성립하는지 "
-        "평가하라. 시그널이 '아니오'인데 있다고 서술하면 심각한 오류다.\n"
+        "5) [가치 포지션]은 투자포인트 정량 데이터의 52주 밴드 위치·가치 시그널 여부를 "
+        "그대로(대괄호 태그 없이) 서술하되, 반드시 숫자로 직접 비교해서 판단하라 — "
+        "예를 들어 '밴드위치 X%가 하단 기준 Y% 이하'라고 쓰려면 X<=Y를 실제로 확인하고, "
+        "X>Y이면 '하단 기준을 살짝 초과'처럼 정확하게 써라. 가치 시그널 필드가 '아니오'이면 "
+        "그 이유(밴드 기준 미충족 또는 예상실적 방향 불명 등 구체적 이유)까지 정확히 설명하고, "
+        "밴드 기준을 충족했다고 서술하면 안 된다. 시그널이 '아니오'인데 '충족'/'성립'이라고 "
+        "서술하면 같은 절 안에서 스스로 모순되는 심각한 오류다.\n"
         "6) 근거 청크에 없는 내용은 '자료상 확인 불가'라고 명시하라.\n"
         "7) 제공된 블록에 없는 파생 수치(YoY%, 배수 등)를 직접 계산해 새로 만들지 마라. "
         "제공된 숫자만 그대로 쓰고, 시점 비교가 필요하면 '2026.03 대비'처럼 어느 기간 "
@@ -604,14 +628,20 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         "8) 한 문장 또는 한 항목에는 그 내용과 직접 관련된 청크 id 하나만 붙여라. 여러 "
         "문장을 이어 쓰고 맨 끝에 인용 하나만 붙이지 마라 — 문장마다 그 문장의 실제 "
         "근거 청크를 따로 표시하라.\n"
-        "9) 3단계 교차검증에서 [교차검증]의 어느 항목이 ❌(불일치)면, 그 항목의 숫자는 "
+        "9) 사업보고서 청크에서 금액 숫자를 인용할 때는 그 청크에 적힌 단위(예: 백만원, "
+        "천원, 억원)를 반드시 그대로 확인하고 그 단위째로 써라. 다른 블록([재무 시계열], "
+        "[투자포인트(정량) 등])은 억원 단위지만, 청크 원문 표는 백만원 단위인 경우가 많다 "
+        "— 단위를 확인하지 않고 숫자만 그대로 '억원'이라 쓰면 100배 부풀리는 심각한 오류다. "
+        "청크에 적힌 단위를 그대로 밝혀 쓰거나(예: '수주잔고 4,774억원(원문 477,440백만원)'), "
+        "단위가 불확실하면 숫자를 쓰지 말고 '단위 확인 필요'라고 하라.\n"
+        "10) 3단계 교차검증에서 [교차검증]의 어느 항목이 ❌(불일치)면, 그 항목의 숫자는 "
         "어느 쪽이 맞는지 스스로 판단하지 말고 '소스 간 불일치 — 사람 확인 필요'라고 "
         "그대로 밝혀라.\n"
-        "10) [컨센서스 대비]에서 과거와 비교하려면 [과거 분석 이력]에 실제로 적힌 "
+        "11) [컨센서스 대비]에서 과거와 비교하려면 [과거 분석 이력]에 실제로 적힌 "
         "날짜·수치만 근거로 '지난 분석(YYYY-MM-DD) 대비 개선/악화' 식으로 서술하라. "
         "이력이 없거나('과거 분석 이력 없음') 비교할 수치가 없으면 비교 서술 자체를 "
         "하지 말고 '과거 이력 없음'이라고만 써라 — 이력에 없는 추세를 지어내지 마라.\n"
-        "11) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
+        "12) 출력 형식: [핵심 이슈] [투자포인트] [리스크] [성장 시나리오] [가치 포지션] "
         "[컨센서스 대비] [데이터 공백]"
     )
 
@@ -649,9 +679,17 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
 
     try:
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
-        return {"report": resp.content if isinstance(resp.content, str)
-                else str(resp.content),
-                "history_drift": b.get("history_drift")}
+        text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        if not text.strip():
+            # 실측 원인: qwen3 등 'thinking' 모델이 재생성 시도(피드백 블록으로 프롬프트가
+            # 길어짐)에서 내부 추론만 하다 max_tokens를 다 써버려 최종 답변이 빈 문자열로
+            # 오는 경우가 있다. 빈 문자열을 그대로 report로 넘기면 verify_scenario가
+            # '검증 대상 없음(consistent=True)'로 잘못 통과시켜 실패가 성공처럼 보인다.
+            return {"errors": _append_error(
+                        state, "analyze(llm)",
+                        RuntimeError("LLM 응답이 비어 있음(추론만 하고 답변 미생성 가능성)")),
+                    "report": "(LLM 응답 비어있음 — 재시도 필요)"}
+        return {"report": text, "history_drift": b.get("history_drift")}
     except Exception as e:  # noqa: BLE001  (네트워크/키 등 광범위)
         return {"errors": _append_error(state, "analyze(llm)", e),
                 "report": "(LLM 호출 실패)"}
@@ -700,8 +738,16 @@ def _verify_scenario_core(state: AnalysisState) -> AnalysisState:
     """3단계 2차 검증 레이어: LLM 리포트가 invest_point 시그널과 같은 방향을
     말하는지 + 제공되지 않은 파생 수치를 지어내지 않았는지(환각 통제)."""
     report = state.get("report", "")
-    if not report:
-        return {"scenario_consistency": {"consistent": True, "verdict": "(검증 대상 없음)"}}
+    # analyze()가 실패하면 항상 "(...)" 형태의 플레이스홀더를 report에 넣는다
+    # (데이터 부족/LLM 호출 실패/빈 응답 등). 이걸 '검증할 게 없으니 일관됨(True)'
+    # 으로 처리하면 생성 실패가 통과처럼 보이는 실측 버그가 있었다 — 명확히
+    # 실패로 표시해서 재생성 트리거/최종 경고까지 이어지게 한다.
+    if not report or report.strip().startswith("("):
+        return {"scenario_consistency": {
+            "consistent": False,
+            "problems": ["리포트 생성 실패"],
+            "verdict": f"❌ 리포트 생성 실패: {report or '(리포트 없음)'}",
+        }}
     try:
         import scenario_check
         blocks = _build_prompt_blocks(state)
