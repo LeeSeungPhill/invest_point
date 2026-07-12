@@ -14,6 +14,10 @@ analysis_history.py
   - investment_summary 컬럼: 4단계(mvp_graph.build_investment_summary)가 만든
     '컨센서스+리포트 결합 투자포인트 요약'을 그대로 저장해, 주간 배치 등에서
     리포트 전문 없이도 이 컬럼만 훑어 종목별 투자포인트를 빠르게 확인할 수 있다.
+  - avg_grounding 컬럼: citation_verdict 문자열만으로는 나중에 "판정과 grounding
+    점수가 실제로 앞뒤가 맞았는지"를 감사(audit)할 수 없어서(과거 실행 하나가
+    grounding 0.227인데 verdict가 '✅ 인용 신뢰'로 나온 의심 사례가 있었으나
+    수치가 없어 재현/검증 불가) 원시 숫자를 별도로 남긴다.
 
 접속정보(.env): PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD.
 DISABLE_HISTORY=1 로 저장/조회를 모두 끌 수 있다(DB 접속 불가 환경 대비).
@@ -48,6 +52,7 @@ CREATE TABLE IF NOT EXISTS analysis_history (
     target_upside_pct DOUBLE PRECISION,
     price DOUBLE PRECISION,
     citation_verdict TEXT,
+    avg_grounding DOUBLE PRECISION,
     cross_check_ok BOOLEAN,
     scenario_verdict TEXT,
     regenerated BOOLEAN,
@@ -56,6 +61,7 @@ CREATE TABLE IF NOT EXISTS analysis_history (
 );
 CREATE INDEX IF NOT EXISTS idx_hist_stock_time ON analysis_history(stock_code, run_at DESC);
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS investment_summary TEXT;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS avg_grounding DOUBLE PRECISION;
 """
 
 
@@ -101,14 +107,15 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                 """INSERT INTO analysis_history
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
-                    citation_verdict, cross_check_ok, scenario_verdict, regenerated, report,
-                    investment_summary)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
+                    regenerated, report, investment_summary)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
                  bool(valuation.get("signal")), valuation.get("band_position"),
                  valuation.get("target_upside_pct"), (price or {}).get("price"),
                  (citation_report or {}).get("verdict"),
+                 (citation_report or {}).get("avg_grounding"),
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
                  bool(regenerated), report, investment_summary),
@@ -162,6 +169,7 @@ def format_history_block(history: list[dict]) -> str:
             f"밴드위치={_fmt_pct(h.get('band_position'))}, "
             f"주가={_fmt_price(h.get('price'))}, "
             f"인용판정={h.get('citation_verdict') or '-'}"
+            f"(grounding={h.get('avg_grounding')})"
         )
     return "\n".join(lines)
 

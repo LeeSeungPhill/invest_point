@@ -453,6 +453,15 @@ def _fetch_cf1002_series(code: str, frq: str) -> list[dict]:
         if len(tds) < 4:
             continue
         rev, op, ni = _num(tds[0]), _num(tds[2]), _num(tds[3])
+        if rev is not None and rev < 0:
+            # 실측: WiseReport 원본 표 자체에 매출액이 음수로 찍힌 사례 확인(182360
+            # 2025.12 매출 -594억원 — 전후 분기는 +501/+151로 정상). 매출은 특이한
+            # 회계 조정이 아닌 이상 음수일 수 없으므로, 이건 우리 파싱이 아니라
+            # 소스 데이터 자체의 오류로 보고 결측치로 처리한다(잘못된 값을 그대로
+            # 성장률 계산·LLM 프롬프트에 흘려보내지 않기 위함).
+            logger.warning("WiseReport cF1002 매출액 음수 이상값 무시(%s, %s): %s",
+                           code, period_raw, rev)
+            rev = None
         if rev is None and op is None and ni is None:
             continue
         rows.append({
