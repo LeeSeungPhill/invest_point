@@ -59,8 +59,11 @@ from langgraph.graph import StateGraph, START, END
 from dart_client import DartClient, DartError, REPRT_CODE
 from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
+from invest_point import build_growth_signal
 from cross_check import run_cross_check, format_cross_check_block
 from scenario_check import SECTION_TAGS
+from industry_category import classify_industry
+import stability_score
 import analysis_history
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
@@ -86,6 +89,9 @@ class AnalysisState(TypedDict, total=False):
     disclosures: list           # 최근 DART 공시 목록(반복성 공시 제외)
     price: dict                 # 현재가·52주 밴드·PER/PBR·컨센서스 목표주가
     invest_point: dict          # 성장/가치 정량 시그널(invest_point.py 계산)
+    financial_history: dict     # DART 최근 확정 연간 사업보고서 기준 3개년 재무제표(FinancialSeries)
+    industry_category: dict     # 업종 카테고리(경기민감도/자본집약도, KSIC 기반)
+    stability: dict             # 실적안정성/재무안정성 점수(stability_score.py 계산)
     cross_check: dict           # 3단계: 소스 간 교차검증 결과(목표주가/투자의견/밴드 정합성)
     n_chunks: int               # RAG 청크 수
     retrieved_chunks: list      # LLM에 제시한 근거 청크(인용 검증 대상)
@@ -229,6 +235,60 @@ def fetch_price(state: AnalysisState) -> AnalysisState:
                 "sources_status": {"price": "error"}}
 
 
+def fetch_financial_history(state: AnalysisState) -> AnalysisState:
+    """최근 확정 연간 사업보고서(reprt_code=11011) 기준 3개년(당기/전기/전전기)
+    재무제표 — 실적안정성/재무안정성 점수용. fetch_financials가 쓰는 '최신 정기
+    보고서'는 분기일 수 있어(그러면 당기/전기/전전기가 같은 분기끼리 비교가 되어
+    연간 변동성 계산에 부적합) 여기서는 연간 보고서로 고정 조회한다. 아직 그 해
+    사업보고서가 안 나왔을 수도 있어 작년→재작년 순으로 시도한다."""
+    if not state.get("corp_code"):
+        return {"sources_status": {"financial_history": "skip"}}
+    this_year = int(time.strftime("%Y"))
+    last_err: Optional[Exception] = None
+    for candidate_year in (this_year - 1, this_year - 2):
+        try:
+            fs = _dart.financial_series(state["corp_code"], str(candidate_year), "11011")
+            if fs.revenue:
+                return {"financial_history": fs, "sources_status": {"financial_history": "ok"}}
+        except DartError as e:
+            last_err = e
+            continue
+    return {"errors": _append_error(state, "fetch_financial_history",
+                                    last_err or DartError("연간 사업보고서 재무 데이터 없음")),
+            "sources_status": {"financial_history": "error"}}
+
+
+def fetch_industry_category(state: AnalysisState) -> AnalysisState:
+    """DART company.json의 induty_code(KSIC)로 실적/재무안정성 점수의 업종
+    카테고리(경기민감도/자본집약도)를 분류한다."""
+    if not state.get("corp_code"):
+        return {"sources_status": {"industry_category": "skip"}}
+    try:
+        overview = _dart.company_overview(state["corp_code"])
+        category = classify_industry(overview.get("induty_code"))
+        return {"industry_category": category, "sources_status": {"industry_category": "ok"}}
+    except DartError as e:
+        return {"errors": _append_error(state, "fetch_industry_category", e),
+                "sources_status": {"industry_category": "error"}}
+
+
+def build_stability(state: AnalysisState) -> AnalysisState:
+    """3단계: 실적안정성(매출·영업이익 변동성, FnGuide 연간 실측 기준) + 재무안정성
+    (유동/부채/자기자본비율, DART 연간 기준) 점수 계산. fetch_fnguide/
+    fetch_financial_history/fetch_industry_category 결과만으로 순수 계산(숫자
+    생성 없음). next_est/next_est2(향후분기 급변위험 판단용)는 fnguide로 growth
+    시그널을 한 번 더 계산해 얻는다(build_invest_point와는 독립적인 병렬 노드라
+    그 결과에 의존할 수 없음 — analyze의 fan-in 깊이를 안 건드리기 위함)."""
+    fnguide = state.get("fnguide")
+    fs = state.get("financial_history")
+    category = state.get("industry_category")
+    growth = build_growth_signal(fnguide or {})
+    earnings = stability_score.build_earnings_stability(
+        fnguide, growth.get("next_est"), growth.get("next_est2"), category)
+    financial = stability_score.build_financial_stability(fs, category)
+    return {"stability": {"earnings": earnings, "financial": financial}}
+
+
 def fetch_disclosures(state: AnalysisState) -> AnalysisState:
     """최근 DART 공시 목록(지분/임원 등 반복성 공시 제외)."""
     if not state.get("corp_code"):
@@ -257,8 +317,8 @@ def fetch_biz_summary(state: AnalysisState) -> AnalysisState:
 
 
 def build_invest_point(state: AnalysisState) -> AnalysisState:
-    """2단계: 성장(예상실적 방향) + 가치(52주 밴드 위치) 정량 시그널 계산.
-    fetch_fnguide/fetch_price 결과만으로 순수 계산(숫자 생성 없음)."""
+    """2단계: 성장(예상실적 방향) + 가치(컨센서스 목표주가 상승여력) 정량 시그널
+    계산. fetch_fnguide/fetch_price 결과만으로 순수 계산(숫자 생성 없음)."""
     ip = build_invest_point_calc(state.get("fnguide"), state.get("price"))
     return {"invest_point": ip}
 
@@ -301,6 +361,7 @@ def save_history(state: AnalysisState) -> AnalysisState:
             scenario_consistency=state.get("scenario_consistency"),
             regenerated=bool(state.get("regenerated")), report=state.get("report"),
             investment_summary=state.get("investment_summary"),
+            stability=state.get("stability"),
         )
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
@@ -324,59 +385,31 @@ def _extract_report_section(report: str, tag: str) -> str:
 
 
 def build_investment_summary(state: AnalysisState) -> AnalysisState:
-    """4단계: 컨센서스(목표주가/투자의견 — 코드 계산값)와 3단계 검증을 거친 LLM
-    리포트의 정성 절([투자포인트]/[가치 포지션]/[컨센서스 대비])을 묶어 한 번에
-    보는 '투자포인트 요약'을 만든다. 여기서는 새 숫자를 만들지 않고 이미 만들어진
-    컨센서스 수치 + 검증된 리포트 문장만 재구성한다(추가 LLM 호출 없음)."""
+    """4단계: 3단계 검증까지 끝난 LLM 리포트에서 [핵심 이슈]/[투자포인트]/[리스크]
+    절만 뽑아 investment_summary로 남긴다(사용자 확정 — 이 3개 절만). 여기서는
+    새 숫자를 만들지 않고 이미 검증된 리포트 문장만 재구성한다(추가 LLM 호출 없음)."""
     report = state.get("report") or ""
-    cons = state.get("consensus") or {}
-    fng_cons = (state.get("fnguide") or {}).get("consensus") or {}
-    ip = state.get("invest_point") or {}
-    growth = ip.get("growth") or {}
-    valuation = ip.get("valuation") or {}
 
     lines = []
-    if cons.get("n_target_prices"):
-        lines.append(
-            f"- 컨센서스(자체 집계 {cons['n_target_prices']}건): 목표주가 평균 "
-            f"{cons.get('target_price_mean'):,} / 중앙값 {cons.get('target_price_median'):,}, "
-            f"투자의견 {cons.get('opinion_distribution') or '자료 부족'}"
-        )
-    elif fng_cons.get("target_price") or fng_cons.get("opinion_label"):
-        lines.append(
-            f"- 컨센서스(FnGuide): 목표주가 {fng_cons.get('target_price') or '자료 없음'}, "
-            f"투자의견 {fng_cons.get('opinion_label') or '자료 없음'}"
-        )
-    else:
-        lines.append("- 컨센서스: 자료상 확인 불가")
-
-    if valuation.get("target_upside_pct") is not None:
-        lines.append(f"- 목표주가 대비 상승여력: {valuation['target_upside_pct']}%")
-    lines.append(f"- 성장 판단(정량): {growth.get('trend') or '자료상 확인 불가'}")
-    lines.append(f"- 가치 시그널(정량, 실적상승+주가하단 동시충족): "
-                f"{'예' if valuation.get('signal') else '아니오'}")
-
-    for tag in ("투자포인트", "가치 포지션", "컨센서스 대비"):
+    for tag in ("핵심 이슈", "투자포인트", "리스크"):
         section = _extract_report_section(report, tag)
         if section:
-            lines.append(f"\n[{tag}]\n{section}")
+            lines.append(f"[{tag}]\n{section}")
 
     # analyze() 실패 시 report는 빈 문자열이 아니라 "(...)" 플레이스홀더로 채워진다
     # (데이터 부족/LLM 호출 실패/빈 응답). 두 경우 모두 실제 절이 하나도 안 뽑혔을
-    # 것이므로, '리포트 미생성'임을 명확히 표시한다(조용히 정량 요약만 보여주면
-    # 실패를 정상 결과처럼 오인하기 쉽다).
+    # 것이므로, '리포트 미생성'임을 명확히 표시한다(조용히 빈 값을 남기면 실패를
+    # 정상 결과처럼 오인하기 쉽다).
     if not report or report.strip().startswith("("):
-        lines.append(f"\n(리포트 미생성 — 정량 컨센서스만 반영: {report or '리포트 없음'})")
+        lines.append(f"(리포트 미생성: {report or '리포트 없음'})")
 
-    return {"investment_summary": "\n".join(lines)}
+    return {"investment_summary": "\n\n".join(lines)}
 
 
 # 사업의 내용에서 뽑을 관점들 (각 질의로 관련 청크를 검색)
 _ASPECTS = {
-    "핵심이슈": "회사의 최근 핵심 이슈, 업황 변화, 주요 사건과 환경 변화",
-    "투자포인트": "성장 동력, 경쟁력, 수주잔고, 신사업, 시장 점유율, 생산능력 증설",
+    "핵심이슈": "회사의 최근 핵심 이슈, 업황 변화, 주요 사건과 환경 변화, 매출과 실적을 좌우하는 제품군, 판가, 물량, 가동률, 전방 수요, 성장 동력, 경쟁력, 수주잔고, 신사업, 시장 점유율, 생산능력 증설",
     "리스크": "위험 요인, 원자재 가격, 환율, 규제, 소송, 경쟁 심화, 전방산업 부진",
-    "매출동인": "매출과 실적을 좌우하는 제품군, 판가, 물량, 가동률, 전방 수요",
 }
 
 
@@ -543,6 +576,12 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
     ip = state.get("invest_point") or {}
     ip_block = format_invest_point_block(ip) if ip else "(정량 투자포인트 계산 불가)"
 
+    stability = state.get("stability") or {}
+    stability_block = (
+        stability_score.format_stability_block(stability["earnings"], stability["financial"])
+        if stability else "(실적안정성/재무안정성 계산 불가)"
+    )
+
     cc = state.get("cross_check") or {}
     cross_check_block = format_cross_check_block(cc) if cc else "(교차검증 미실행)"
 
@@ -557,6 +596,7 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
         "fin_block": fin_block, "news_block": news_block, "cons_block": cons_block,
         "fng_cons_block": fng_cons_block, "rep_block": rep_block, "est_block": est_block,
         "discl_block": discl_block, "price_block": price_block, "ip_block": ip_block,
+        "stability_block": stability_block,
         "cross_check_block": cross_check_block, "history_block": history_block,
         "history_drift": history_drift, "valid_ids": valid_ids,
     }
@@ -598,7 +638,13 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         "기간과 비교한 것인지 명시하라(예: '직전분기 대비 감소', '2026년(E) 대비 증가'). "
         "과거 실적은 부진했지만 예상 실적은 개선되는 경우(저점 통과) 두 서술이 방향은 "
         "달라도 정상이다 — 문제는 방향이 다른 게 아니라 기간을 명시하지 않아 어느 쪽 "
-        "얘기인지 불분명한 것이니, 기간을 항상 같이 써서 모호함을 없애라.\n"
+        "얘기인지 불분명한 것이니, 기간을 항상 같이 써서 모호함을 없애라. [투자포인트]에는 "
+        "성장 시나리오, 가치 포지션과 함께 정량 투자포인트의 영업이익증감률·"
+        "밴드위치·목표주가상승여력과 안정성(정량)의 실적안정성·재무안정성 점수까지 모두 "
+        "그대로(대괄호 태그 없이) 반드시 포함하라(자료상 확인 불가면 그렇게만 써라). 부채비율과 "
+        "그 업종 대비 등급(안정/적정/위험)은 안정성(정량) 데이터에서 그대로 가져와, 이미 "
+        "청크를 인용한 문장 뒤에 이어 붙여 서술하라(수치·등급 자체에는 대괄호 태그를 붙이지 "
+        "말 것 — 규칙3).\n"
         "2) 제공된 '사용 가능 청크 id' 목록에 있는 id만, 그리고 그 청크 내용과 실제로 "
         "관련된 문장에만 인용하라. 관련 없는 청크 id를 숫자 뒤에 습관적으로 붙이는 것도 "
         "환각 인용과 같은 수준의 오류다.\n"
@@ -610,10 +656,10 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         "그대로 따와 문장 끝에 붙이는 것은 실재하지 않는 인용을 만드는 것과 같은 오류다). "
         "없으면 '구체 수치 자료 없음'이라 쓰고 방향(증가/감소/유지)만 기술하라.\n"
         "4) [성장 시나리오]는 투자포인트 정량 데이터의 '성장 판단'과 영업이익 증감률 숫자를 "
-        "그대로(대괄호 태그 없이) 서술하고, 그 방향을 뒷받침하는 사업보고서상의 정성적 근거"
-        "(증설/수주/신사업 등)가 있으면 별도 문장으로 덧붙이며 그 문장 끝에만 실제 관련 "
-        "청크 id를 붙여라. 관련 청크가 없으면 정성 근거 문장 자체를 쓰지 말고 "
-        "'정성적 근거는 자료상 확인 불가'라고만 써라.\n"
+        "그대로(대괄호 태그 없이) 서술하라(자료상 확인 불가면 그렇게만 써라). 그 방향을 "
+        "뒷받침하는 사업보고서상의 정성적 근거(증설/수주/신사업 등)가 있으면 별도 문장으로 "
+        "덧붙이며 그 문장 끝에만 실제 관련 청크 id를 붙여라. 관련 청크가 없으면 정성 근거 "
+        "문장 자체를 쓰지 말고 '정성적 근거는 자료상 확인 불가'라고만 써라.\n"
         "5) [가치 포지션]은 투자포인트 정량 데이터의 52주 밴드 위치·가치 시그널 여부를 "
         "그대로(대괄호 태그 없이) 서술하되, 반드시 숫자로 직접 비교해서 판단하라 — "
         "예를 들어 '밴드위치 X%가 하단 기준 Y% 이하'라고 쓰려면 X<=Y를 실제로 확인하고, "
@@ -663,6 +709,7 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         f"[재무 시계열(실적, DART)]\n{b['fin_block']}\n\n"
         f"[연간/분기/예상 실적(FnGuide/WiseReport)]\n{b['est_block']}\n\n"
         f"[투자포인트(정량) — 성장/가치, 코드 계산값 그대로 인용]\n{b['ip_block']}\n\n"
+        f"[안정성(정량) — 실적안정성/재무안정성, 코드 계산값 그대로 인용]\n{b['stability_block']}\n\n"
         f"[주가/밸류에이션]\n{b['price_block']}\n\n"
         f"[교차검증 — 서로 다른 소스 간 정합성]\n{b['cross_check_block']}\n\n"
         f"[과거 분석 이력 — 최신순, 이 안의 날짜·수치만 비교에 사용 가능]\n{b['history_block']}\n\n"
@@ -792,6 +839,9 @@ def build_graph():
     g.add_node("fetch_research", fetch_research)
     g.add_node("fetch_fnguide", fetch_fnguide)
     g.add_node("fetch_price", fetch_price)
+    g.add_node("fetch_financial_history", fetch_financial_history)
+    g.add_node("fetch_industry_category", fetch_industry_category)
+    g.add_node("build_stability", build_stability)
     g.add_node("fetch_disclosures", fetch_disclosures)
     g.add_node("build_invest_point", build_invest_point)
     g.add_node("cross_check_sources", cross_check_sources)
@@ -826,12 +876,25 @@ def build_graph():
     g.add_edge("fetch_business", "rag_retrieve")
     g.add_edge("fetch_biz_summary", "rag_retrieve")
     g.add_edge("rag_retrieve", "analyze")
-    # 2단계 정량 시그널 체인: fnguide + 시세 → build_invest_point → analyze
+    # 2단계 정량 시그널 체인: fnguide + 시세 → build_invest_point → analyze.
+    # analyze에 새 엣지를 추가하지 않는다 — analyze는 defer=True로 등록된 비대칭
+    # fan-in 지점이라, 새 수집 노드를 여기 직접 연결하면 fan-in 깊이가 또 바뀌어
+    # 더블 실행 버그가 재발할 위험이 있다(위 주석 참조).
     g.add_edge("resolve_corp", "fetch_fnguide")
     g.add_edge("resolve_corp", "fetch_price")
     g.add_edge("fetch_fnguide", "build_invest_point")
     g.add_edge("fetch_price", "build_invest_point")
     g.add_edge("build_invest_point", "analyze")
+    # 3단계 안정성 점수 체인: 연간 재무제표 + 업종카테고리 + fnguide(실적안정성용
+    # 연간 실측·향후분기) → build_stability → analyze. build_invest_point와 동일한
+    # 이유로 depth 2를 유지하고 analyze에는 직접 연결하지 않는다. fetch_fnguide는
+    # 이미 depth 1(resolve_corp 바로 다음)이라 여기 엣지를 추가해도 depth는 안 바뀐다.
+    g.add_edge("resolve_corp", "fetch_financial_history")
+    g.add_edge("resolve_corp", "fetch_industry_category")
+    g.add_edge("fetch_fnguide", "build_stability")
+    g.add_edge("fetch_financial_history", "build_stability")
+    g.add_edge("fetch_industry_category", "build_stability")
+    g.add_edge("build_stability", "analyze")
     # 나머지 수집 노드는 병렬로 analyze에 fan-in
     g.add_edge("resolve_corp", "fetch_financials")
     g.add_edge("resolve_corp", "fetch_news")

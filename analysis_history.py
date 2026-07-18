@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS analysis_history (
 CREATE INDEX IF NOT EXISTS idx_hist_stock_time ON analysis_history(stock_code, run_at DESC);
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS investment_summary TEXT;
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS avg_grounding DOUBLE PRECISION;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS earnings_stability_score INTEGER;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS financial_stability_score INTEGER;
+-- 성장점수/가치점수 기능 자체를 제거하기로 해서(사용자 확정) 컬럼도 드롭한다.
+ALTER TABLE analysis_history DROP COLUMN IF EXISTS growth_score;
+ALTER TABLE analysis_history DROP COLUMN IF EXISTS value_score;
 """
 
 
@@ -92,13 +97,16 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             citation_report: Optional[dict] = None, cross_check: Optional[dict] = None,
             scenario_consistency: Optional[dict] = None, regenerated: bool = False,
             report: Optional[str] = None,
-            investment_summary: Optional[str] = None) -> None:
+            investment_summary: Optional[str] = None,
+            stability: Optional[dict] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
         return
     growth = (invest_point or {}).get("growth", {})
     valuation = (invest_point or {}).get("valuation", {})
+    earnings_stability = (stability or {}).get("earnings") or {}
+    financial_stability = (stability or {}).get("financial") or {}
     conn = _connect()
     try:
         _ensure_schema(conn)
@@ -108,8 +116,9 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
                     citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
-                    regenerated, report, investment_summary)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    regenerated, report, investment_summary,
+                    earnings_stability_score, financial_stability_score)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
                  bool(valuation.get("signal")), valuation.get("band_position"),
@@ -118,7 +127,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  (citation_report or {}).get("avg_grounding"),
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
-                 bool(regenerated), report, investment_summary),
+                 bool(regenerated), report, investment_summary,
+                 earnings_stability.get("score"), financial_stability.get("score")),
             )
         conn.commit()
     finally:
@@ -169,7 +179,9 @@ def format_history_block(history: list[dict]) -> str:
             f"밴드위치={_fmt_pct(h.get('band_position'))}, "
             f"주가={_fmt_price(h.get('price'))}, "
             f"인용판정={h.get('citation_verdict') or '-'}"
-            f"(grounding={h.get('avg_grounding')})"
+            f"(grounding={h.get('avg_grounding')}), "
+            f"실적안정성={h.get('earnings_stability_score')} "
+            f"재무안정성={h.get('financial_stability_score')}"
         )
     return "\n".join(lines)
 

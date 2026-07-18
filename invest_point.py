@@ -15,12 +15,21 @@ invest_point.py
   가치(value)   : 52주 밴드 내 주가 위치(band_position, 0=최저~1=최고)가 낮은데
                   (<= LOW_BAND_THRESHOLD) 예상 영업이익이 직전 실적보다 높으면(est_rising)
                   '실적 상승 + 주가 하단' 시그널(signal=True).
+
+(성장점수/가치점수는 실사용 결과 제거했다 — 대신 아래 growth/valuation의 raw 필드
+ (growth_trend/op_yoy_forward/value_signal/band_position/target_upside_pct)를
+ 그대로 리포트에 노출한다. SCORE_MAX/REVENUE_WEIGHT/OP_PROFIT_WEIGHT는
+ stability_score.py의 실적안정성 계산(변동계수 가중평균)이 계속 재사용한다.)
 """
 from __future__ import annotations
 
 from typing import Optional
 
 LOW_BAND_THRESHOLD = 0.4  # 52주 밴드 하위 40% 이내를 '하단'으로 본다
+
+SCORE_MAX = 100          # stability_score.py가 재사용(실적/재무안정성 점수 스케일)
+REVENUE_WEIGHT = 0.7     # stability_score.py가 재사용(변동계수 가중평균 시 매출 가중치)
+OP_PROFIT_WEIGHT = 0.3   # stability_score.py가 재사용(변동계수 가중평균 시 영업이익 가중치)
 
 
 def _growth(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
@@ -63,7 +72,7 @@ def build_growth_signal(fnguide: dict) -> dict:
     if not actual_rows:
         return {"basis": basis, "latest": None, "prev": None, "next_est": None,
                 "op_yoy_actual": None, "op_yoy_forward": None,
-                "turn_to_profit": None, "trend": None,
+                "turn_to_profit": None, "trend": None, "actual_rows": [],
                 "notes": ["실적 실측치 없음 — 자료상 확인 불가"]}
 
     latest = actual_rows[-1]
@@ -99,6 +108,7 @@ def build_growth_signal(fnguide: dict) -> dict:
         "latest": latest, "prev": prev, "next_est": next_est, "next_est2": next_est2,
         "op_yoy_actual": op_yoy_actual, "op_yoy_forward": op_yoy_forward,
         "turn_to_profit": turn_to_profit, "trend": trend,
+        "actual_rows": actual_rows,
         "notes": notes,
     }
 
@@ -132,7 +142,8 @@ def build_value_signal(price: dict, growth: dict) -> dict:
 
 
 def build_invest_point(fnguide: Optional[dict], price: Optional[dict]) -> dict:
-    """성장 + 가치 시그널을 합쳐 정량 투자포인트를 만든다. LLM 프롬프트에 그대로 제시."""
+    """성장 + 가치 시그널을 합쳐 정량 투자포인트를 만든다. LLM 프롬프트에
+    그대로 제시."""
     fnguide = fnguide or {}
     growth = build_growth_signal(fnguide)
     value = build_value_signal(price or {}, growth)

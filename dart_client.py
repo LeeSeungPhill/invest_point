@@ -93,6 +93,11 @@ class FinancialSeries:
     revenue: dict = field(default_factory=dict)        # 매출액
     operating_profit: dict = field(default_factory=dict)  # 영업이익
     net_income: dict = field(default_factory=dict)     # 당기순이익
+    current_assets: dict = field(default_factory=dict)      # 유동자산
+    current_liabilities: dict = field(default_factory=dict)  # 유동부채
+    equity: dict = field(default_factory=dict)          # 자본총계
+    liabilities: dict = field(default_factory=dict)     # 부채총계
+    assets: dict = field(default_factory=dict)          # 자산총계
 
 
 class DartClient:
@@ -259,7 +264,14 @@ class DartClient:
     # ------------------------------------------------------------------ #
     def financial_series(self, corp_code: str, bsns_year: str,
                          reprt_code: str = "11011") -> FinancialSeries:
-        """단일회사 주요계정. 당기/전기/전전기 3개년 매출/영업이익/순이익."""
+        """단일회사 주요계정. 당기/전기/전전기 3개년 매출/영업이익/순이익 +
+        유동자산/유동부채/자본총계/부채총계/자산총계.
+
+        실측 버그(112610로 확인): fs_div="CFS"로 요청해도 OpenDART는 CFS/OFS
+        (연결/별도) 행을 둘 다 돌려준다. 예전 코드는 data["list"] 전체를 그냥
+        순회하며 account_nm만 보고 덮어썼는데, OFS 행이 나중에 나오면 그게 마지막
+        값으로 남아 별도재무제표 숫자(예: 매출액 6,135억)가 연결 숫자(2조 9,316억)
+        대신 저장됐다 — 4.8배 차이. fs_div로 명시적으로 필터링해야 한다."""
         data = self._get(
             "fnlttSinglAcnt.json",
             corp_code=corp_code,
@@ -273,12 +285,20 @@ class DartClient:
                 bsns_year=bsns_year, reprt_code=reprt_code, fs_div="OFS",
             ).json()
         self._check_json_status(data, "fnlttSinglAcnt.json")
+        rows = [r for r in data.get("list", []) if r.get("fs_div") in ("CFS", "OFS")]
+        cfs_rows = [r for r in rows if r.get("fs_div") == "CFS"]
+        rows = cfs_rows or rows  # CFS가 있으면 CFS만, 없으면(OFS 응답) OFS만 남는다
 
         fs = FinancialSeries()
         target = {
             "매출액": fs.revenue,
             "영업이익": fs.operating_profit,
             "당기순이익": fs.net_income,
+            "유동자산": fs.current_assets,
+            "유동부채": fs.current_liabilities,
+            "자본총계": fs.equity,
+            "부채총계": fs.liabilities,
+            "자산총계": fs.assets,
         }
         # 각 계정은 당기/전기/전전기 금액을 함께 제공한다.
         period_cols = [
@@ -286,7 +306,7 @@ class DartClient:
             ("frmtrm_nm", "frmtrm_amount"),     # 전기
             ("bfefrmtrm_nm", "bfefrmtrm_amount"),  # 전전기
         ]
-        for row in data.get("list", []):
+        for row in rows:
             acct = row.get("account_nm", "").strip()
             bucket = target.get(acct)
             if bucket is None:
@@ -297,6 +317,22 @@ class DartClient:
                 if label and amount is not None:
                     bucket[label] = amount
         return fs
+
+    # ------------------------------------------------------------------ #
+    # 4-1) 기업개황(업종코드) — 실적/재무안정성의 업종 카테고리 보정용
+    # ------------------------------------------------------------------ #
+    def company_overview(self, corp_code: str, *, cache_ttl: int = 30 * 86400) -> dict:
+        """company.json(기업개황)에서 induty_code(KSIC 표준산업분류 코드)를 가져온다.
+        업종은 거의 안 바뀌므로 캐시 TTL을 길게(30일) 둔다."""
+        ck = f"dart_company::{corp_code}"
+        cached = _cache_get(ck, cache_ttl)
+        if cached:
+            return cached
+        data = self._get("company.json", corp_code=corp_code).json()
+        self._check_json_status(data, "company.json")
+        result = {"corp_name": data.get("corp_name"), "induty_code": data.get("induty_code")}
+        _cache_put(ck, result)
+        return result
 
     # ------------------------------------------------------------------ #
     # 5) 사업의 개요 (정확한 섹션 offset 기반) — RAG용 전체 "사업의 내용"과 별개로
