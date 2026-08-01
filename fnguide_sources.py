@@ -28,9 +28,9 @@ FnGuide(comp.fnguide.com) / WiseReport(navercomp.wisereport.co.kr) 직접 스크
 from __future__ import annotations
 
 import html as html_mod
+import json
 import logging
 import re
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
@@ -172,36 +172,103 @@ def _parse_fng_table(tbl_html: str, today_ym: str) -> list[dict]:
     return fh
 
 
+def _extract_js_obj(text: str, key: str) -> Optional[dict]:
+    """`information.init({... key: {...}, ...})`처럼 스크립트에 인라인 주입된 JS
+    객체 리터럴에서 key에 해당하는 값(중첩 객체)만 정확히 잘라 json.loads로 판다.
+    정규식만으로는 중첩된 {}를 안전하게 못 자른다(예: salesPercent 안에 data/
+    expData가 또 배열 속 객체를 담고 있어 '{...}를 최소 매칭'해선 잘림) — 그래서
+    문자 단위로 중괄호 깊이를 세되, 문자열 리터럴("...") 안의 {}는 건너뛴다.
+    이 페이지의 값들은 키가 전부 큰따옴표로 감싸인 정상 JSON이라 json.loads로
+    바로 파싱된다(JS 전용 문법 없음 — 실측 확인)."""
+    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', text)
+    if not m:
+        return None
+    start = m.end() - 1  # '{' 위치
+    depth = 0
+    in_str = False
+    str_ch = ""
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == str_ch:
+                in_str = False
+        else:
+            if ch in ("'", '"'):
+                in_str, str_ch = True, ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        i += 1
+    return None
+
+
 def _fetch_products_xml(code: str) -> dict:
-    """제품비율/시장점유율/키워드 (comp.fnguide.com XML)."""
+    """제품비율/시장점유율/키워드.
+
+    2026년 FnGuide가 구버전 사이트(comp.fnguide.com)의 XML 엔드포인트를 폐쇄하고
+    신버전(wcomp.fnguide.com)으로 이전했다(실측 확인). 신버전은 별도 XML이 아니라
+    회사정보 페이지(CompanyInfo/Information) HTML 안에 <script>로
+    `information.init({ salesPercent: {...}, marketShare: {...}, ... })`처럼
+    데이터를 인라인 주입한다.
+
+    salesPercent.data는 여러 분기를 한 번에 담고 있고(FY1~FY4_AMT 키, header가
+    각 키의 실제 기간 라벨(YYYY/MM)을 알려줌 — FY1이 가장 최근), 세그먼트별로
+    분기마다 결측(null)이 섞여 있어 가장 최근 기간(header상 NM이 제일 큰 값)의
+    값만 골라 쓴다. marketShare는 단일 기간(YYMM)이라 그대로 쓴다."""
     out = {"products": [], "market_shares": [], "keywords": []}
     try:
-        r = _request("GET", f"https://comp.fnguide.com/SVO2/xml/corp_ifrs/{code}.xml",
+        r = _request("GET", f"https://wcomp.fnguide.com/CompanyInfo/Information?gicode=A{code}",
                      headers=_FNG_HDR, timeout=12, retries=2)
-        xml_text = r.content.decode("euc-kr").replace('encoding="euc-kr"', 'encoding="utf-8"')
-        root = ET.fromstring(xml_text.encode("utf-8"))
+        text = r.content.decode("utf-8", errors="replace")
 
-        pr = root.find("product_rate")
-        if pr is not None:
-            for rec in pr.findall("record"):
-                name = (rec.findtext("name") or "").strip()
-                value = (rec.findtext("value") or "").strip()
-                if not name or "내부거래" in name or name.startswith("기타"):
-                    continue
-                try:
-                    pct = float(value.replace(",", ""))
-                    if pct > 0:
-                        out["products"].append({"name": name, "pct": round(pct, 1)})
-                except ValueError:
-                    pass
+        # 실측 확인된 문제: ?gicode=A{code} 쿼리스트링이 실제로는 라우팅에 반영되지
+        # 않고 코드와 무관하게 항상 동일한(관찰된 사례: 삼성전자 005930) 페이로드가
+        # 내려오는 경우가 있다(캐시버스팅 파라미터를 붙여도 동일 — 프록시/CDN 캐시가
+        # 아니라 서버 자체가 쿼리스트링을 무시하는 것으로 보임). 이 상태로 그냥
+        # 파싱하면 '조용히 빈 값' 대신 '조용히 엉뚱한 회사 데이터'를 반환하는 더 나쁜
+        # 실패가 되므로, 페이로드의 cmp_cd가 요청한 code와 실제로 일치하는지 반드시
+        # 검증하고, 다르면 신뢰하지 않는다.
+        cmp_m = re.search(r"cmp_cd\s*:\s*['\"](\d+)['\"]", text)
+        if not cmp_m or cmp_m.group(1).zfill(6) != code.zfill(6):
+            logger.warning(
+                "FnGuide 제품정보(%s): 응답의 cmp_cd(%s)가 요청 코드와 불일치 — "
+                "?gicode= 쿼리스트링이 서버에서 무시되고 있는 것으로 보임(신버전 "
+                "사이트의 알려진 문제, 실측 확인). 잘못된 회사 데이터를 쓰지 않도록 "
+                "빈 값으로 유지.", code, cmp_m.group(1) if cmp_m else "없음")
+            return out
 
-        imr = root.find("imp_mkt_ratio")
-        if imr is not None:
-            for rec in imr.findall("record"):
-                pl = (rec.findtext("prod_list") or "").strip()
-                pv = (rec.findtext("prod_ratio") or "").strip()
-                if pl:
-                    out["market_shares"].append({"product": pl, "share": pv})
+        sales = _extract_js_obj(text, "salesPercent")
+        market = _extract_js_obj(text, "marketShare")
+
+        if sales:
+            header = sales.get("header") or []
+            latest = max(header, key=lambda h: h.get("NM") or "", default=None)
+            latest_id = latest.get("ID") if latest else None
+            if latest_id:
+                for rec in sales.get("data") or []:
+                    name = (rec.get("COMM_NM") or "").strip()
+                    val = rec.get(latest_id)
+                    if not name or val is None or "내부거래" in name or name.startswith("기타"):
+                        continue
+                    if val > 0:
+                        out["products"].append({"name": name, "pct": round(float(val), 1)})
+
+        if market:
+            for rec in market.get("data") or []:
+                pl = (rec.get("PRD_NM") or "").strip()
+                pv = rec.get("OCCU_RATIO")
+                if pl and pv is not None:
+                    out["market_shares"].append({"product": pl, "share": round(float(pv), 1)})
 
         seen, keywords = set(), []
         for p in out["products"]:
@@ -211,8 +278,14 @@ def _fetch_products_xml(code: str) -> dict:
                 seen.add(kw)
                 keywords.append(kw)
         out["keywords"] = keywords[:4]
+
+        if not sales and not market:
+            logger.warning(
+                "FnGuide 제품정보(%s): CompanyInfo/Information 페이지에서 "
+                "salesPercent/marketShare 인라인 데이터를 찾지 못함 — 페이지 "
+                "구조가 다시 바뀌었을 수 있음.", code)
     except Exception as e:  # noqa: BLE001
-        logger.warning("FnGuide 제품 XML 수집 실패(%s): %s", code, e)
+        logger.warning("FnGuide 제품정보 수집 실패(%s): %s", code, e)
     return out
 
 
