@@ -192,9 +192,16 @@ class DartClient:
         prefer_order: tuple = ("분기보고서", "반기보고서", "사업보고서"),
         lookback_days: int = 420,
     ) -> Filing:
-        """prefer_order 우선순위에 따라, 해당 유형 중 가장 최근 보고서 1건을 고른다.
-        기본은 분기 -> 반기 -> 사업(가장 신선한 것 우선). 분기/반기 보고서는
-        '사업의 내용'이 사업보고서보다 간략할 수 있다(필요시 순서를 바꿔 사용)."""
+        """정기보고서(1/3분기·반기·사업보고서) 중 접수일 기준 실제로 가장 최근인
+        1건을 고른다. prefer_order는 우선순위가 아니라 '정기보고서로 인정할 유형'
+        화이트리스트일 뿐이다 — 실측 버그(2026-08-14 실제 확인): 예전 코드는
+        prefer_order를 유형별 우선순위로 써서 '분기보고서'부터 통째로 훑었는데,
+        분기보고서가 반기보고서보다 먼저 나온다는 이유만으로 최신 반기보고서
+        (2026.06, 08-14 접수)를 건너뛰고 그보다 3개월 전 분기보고서(2026.03,
+        05-15 접수)를 반환했다 — 문서화된 의도('가장 신선한 것 우선')와 실제
+        동작이 반대였다. list.json 응답이 이미 접수일 최신순이므로, 유형별로
+        따로 훑지 않고 목록을 한 번만 순회해 화이트리스트에 속한 첫 항목(=가장
+        최근)을 그대로 쓴다."""
         memo_key = (corp_code, prefer_order)
         if not hasattr(self, "_report_memo"):
             self._report_memo = {}
@@ -210,23 +217,21 @@ class DartClient:
         self._check_json_status(data, "list.json")
 
         items = data.get("list", [])  # 최신순
-        # 우선순위 유형별로 가장 최근 항목을 찾는다
-        for kind in prefer_order:
-            for item in items:
-                nm = item.get("report_nm", "")
-                if kind in nm:
-                    reprt_code, bsns_year = _infer_reprt(nm, item.get("rcept_dt", ""))
-                    filing = Filing(
-                        corp_code=corp_code,
-                        corp_name=item.get("corp_name", ""),
-                        rcept_no=item["rcept_no"],
-                        report_nm=nm,
-                        rcept_dt=item.get("rcept_dt", ""),
-                        reprt_code=reprt_code,
-                        bsns_year=bsns_year,
-                    )
-                    self._report_memo[memo_key] = filing
-                    return filing
+        for item in items:
+            nm = item.get("report_nm", "")
+            if any(kind in nm for kind in prefer_order):
+                reprt_code, bsns_year = _infer_reprt(nm, item.get("rcept_dt", ""))
+                filing = Filing(
+                    corp_code=corp_code,
+                    corp_name=item.get("corp_name", ""),
+                    rcept_no=item["rcept_no"],
+                    report_nm=nm,
+                    rcept_dt=item.get("rcept_dt", ""),
+                    reprt_code=reprt_code,
+                    bsns_year=bsns_year,
+                )
+                self._report_memo[memo_key] = filing
+                return filing
         raise DartError("최근 정기보고서를 찾지 못했습니다.")
 
     # ------------------------------------------------------------------ #
