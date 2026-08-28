@@ -113,7 +113,17 @@ def check_band_threshold(report_sections: dict, valuation: dict) -> Optional[dic
     if idx < 0:
         return None
     start = max(0, idx - 5)
-    window = section[start: idx + _SIGNAL_WINDOW]
+    end = idx + _SIGNAL_WINDOW
+    # "이하" 뒤 창이 "가치 시그널은 아니오"처럼 별개 절(밴드 조건이 아니라 전체
+    # 시그널에 대한 결론)까지 삼키면, 그 절의 부정어가 부정어-우선 규칙에 걸려
+    # 밴드 조건 자체가 미충족이라고 오판된다(실측 112610: "40% 이하 충족했으나,
+    # 성장 판단이 역성장/둔화로 가치 시그널은 아니오"에서 밴드는 실제로 충족인데
+    # 뒤쪽 "아니오"에 끌려 불일치로 오탐). "시그널" 절이 창 안에서 시작되면
+    # 그 직전에서 창을 잘라 밴드 조건 서술만 본다.
+    sig_idx = section.find("시그널", idx)
+    if 0 <= sig_idx < end:
+        end = sig_idx
+    window = section[start:end]
     said_no = any(w in window for w in _NEG_WORDS)
     said_yes = (not said_no) and any(w in window for w in _POS_WORDS)
 

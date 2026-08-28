@@ -13,11 +13,12 @@ FnGuide(comp.fnguide.com) / WiseReport(navercomp.wisereport.co.kr) 직접 스크
   fetch_fnguide(code) -> dict
     {
       'products': [{'name','pct'}], 'market_shares': [...], 'keywords': [...],
-      'annual_highlight': [...], 'financial_highlight': [...](분기, FnGuide 하이라이트 표),
+      'annual_highlight': [...](연간, 실측 5개년+컨센서스 추정 3개년 — getSnpFinancial),
+      'financial_highlight': [...](분기, FnGuide 하이라이트 표),
       'cf1002': {'freq': 'quarter'|'annual'|'none', 'rows': [...]}
                 (실측+추정이 같은 주기로 나란히 있는 단일 시계열 — 성장률 계산 기준),
       'consensus': {'opinion_label','target_price','eps','per','analyst_count','date'} | None,
-      'source': 'FnGuide'|'WiseReport-fallback'|'none',
+      'source': 'FnGuide-SnpFinancial'|'FnGuide'|'WiseReport-fallback'|'none',
     }
   각 highlight row: {period, is_estimate, revenue, op_profit, net_profit, op_margin, op_growth}
   (단위: 억원)
@@ -47,6 +48,8 @@ _FNG_HDR = {"User-Agent": _BROWSER_UA, "Referer": "https://comp.fnguide.com/",
             "Accept-Language": "ko-KR,ko;q=0.9"}
 _WR_HDR = {"User-Agent": _BROWSER_UA, "Referer": "https://navercomp.wisereport.co.kr/",
            "Accept-Language": "ko-KR,ko;q=0.9"}
+_WCOMP_HDR = {"User-Agent": _BROWSER_UA, "Referer": "https://wcomp.fnguide.com/",
+             "Accept-Language": "ko-KR,ko;q=0.9", "X-Requested-With": "XMLHttpRequest"}
 
 
 def _growth(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
@@ -546,6 +549,68 @@ def _fetch_cf1002_series(code: str, frq: str) -> list[dict]:
     return rows
 
 
+def _fetch_snp_financial(code: str, *, freq_typ: str = "Y", consol_typ: str = "M") -> list[dict]:
+    """wcomp.fnguide.com CompanyInfo/getSnpFinancial(신버전 SPA의 내부 AJAX,
+    Snapshot 페이지에서 재무 하이라이트를 그리는 데 쓰는 것과 동일한 호출) —
+    연간 실적+컨센서스 추정.
+
+    실측 확인(2026):
+      - freq_typ='Y'(순수 연간)로 호출하면 실측 5개년 + 추정 3개년(당해~+2년,
+        header의 EP_CHK='E')을 준다. freq_typ='A'(전체)는 연간+분기가 섞이며
+        추정 연간이 1개로 줄어든다 — 그래서 'Y'를 쓴다.
+      - consol_typ가 없거나 잘못되면(예: 빈 문자열) dataset.data가 통째로 빈
+        배열로 옴 — Snapshot 페이지의 기본 활성 버튼 값인 'M'(주재무제표)을
+        반드시 넘겨야 한다.
+      - 영업이익은 두 행이 따로 있다: 계산식 기반 '영업이익' 행은 추정연도가
+        전부 null이고, 컨센서스가 실제로 채워지는 건 '영업이익(발표기준)' 행
+        쪽이다 — 반드시 후자를 써야 한다.
+      - cmp_cd 쿼리파라미터가 실제로 종목별 라우팅에 반영된다(발행주식수 등
+        타 지표로 교차검증 완료) — CompanyInfo/Information 페이지(제품비중)와
+        달리 여기는 코드 무관 고정 응답 문제가 없다.
+      - 페이지 자체에 "단위 : 억원, %, 배, 주"라고 명시돼 있어 추가 단위 환산이
+        필요 없다(기존 cf1002/annual_highlight와 동일 단위)."""
+    params = {"cmp_cd": code, "consol_typ": consol_typ, "freq_typ": freq_typ}
+    r = _request("GET", "https://wcomp.fnguide.com/CompanyInfo/getSnpFinancial",
+                 headers=_WCOMP_HDR, params=params, timeout=12, retries=2)
+    payload = r.json()
+    dataset = payload.get("dataset") or {}
+    header = dataset.get("header") or []
+    rows_by_name = {d.get("NAME"): d for d in (dataset.get("data") or [])}
+
+    revenue_row = rows_by_name.get("매출액") or {}
+    op_row = rows_by_name.get("영업이익(발표기준)") or rows_by_name.get("영업이익") or {}
+    ni_row = rows_by_name.get("당기순이익") or {}
+
+    def _val(row: dict, cd: str) -> Optional[float]:
+        raw = row.get(cd)
+        if raw in (None, "", "N/A"):
+            return None
+        try:
+            return round(float(raw), 1)
+        except ValueError:
+            return None
+
+    rows = []
+    for h in header:
+        cd, period = h.get("CD"), (h.get("YYMM") or "").strip()
+        if not cd or not period:
+            continue
+        rev, op, ni = _val(revenue_row, cd), _val(op_row, cd), _val(ni_row, cd)
+        if rev is None and op is None and ni is None:
+            continue
+        rows.append({
+            "period": period, "is_estimate": h.get("EP_CHK") == "E",
+            "revenue": rev, "op_profit": op, "net_profit": ni,
+            "op_margin": round(op / rev * 100, 1) if op is not None and rev else None,
+        })
+    rows.sort(key=lambda r: r["period"])
+    for j in range(1, len(rows)):
+        rows[j]["op_growth"] = _growth(rows[j].get("op_profit"), rows[j - 1].get("op_profit"))
+    if rows:
+        rows[0]["op_growth"] = None
+    return rows
+
+
 def fetch_fnguide(stock_code: str, *, cache_ttl: int = 21600) -> dict:
     """FnGuide/WiseReport에서 제품비중·시장점유율·연간/분기 실적+추정·컨센서스 수집.
     전부 실패해도 예외를 던지지 않고 빈 결과를 반환한다(부분 실패는 허용)."""
@@ -566,6 +631,12 @@ def fetch_fnguide(stock_code: str, *, cache_ttl: int = 21600) -> dict:
     }
 
     result.update(_fetch_products_xml(code))
+
+    try:
+        ann_snp = _fetch_snp_financial(code)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("FnGuide getSnpFinancial(연간) 수집 실패(%s): %s", code, e)
+        ann_snp = []
 
     try:
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -595,6 +666,14 @@ def fetch_fnguide(stock_code: str, *, cache_ttl: int = 21600) -> dict:
             result["consensus"] = _fetch_consensus(code, c1_html)
         except Exception as e:  # noqa: BLE001
             logger.warning("FnGuide 컨센서스 파싱 실패(%s): %s", code, e)
+
+    # 연간(annual_highlight)은 getSnpFinancial(실측 5개년 + 컨센서스 추정
+    # 3개년, 신버전 SPA 내부 API)을 우선한다 — 기존 WiseReport 폴백은 실측만
+    # 있고 연간 단위 추정치가 아예 없다(실측 확인). getSnpFinancial 실패시에만
+    # 위에서 만든 ann_fh(있다면)를 그대로 둔다.
+    if ann_snp:
+        result["annual_highlight"] = ann_snp
+        result["source"] = "FnGuide-SnpFinancial"
 
     try:
         qtr_series = _fetch_cf1002_series(code, "1")

@@ -37,6 +37,55 @@ except ImportError:
 import psycopg2
 import psycopg2.extras
 
+# --- 연간 실적 8개년(실측 5개+추정 3개) 컬럼 ---
+# fnguide_sources._fetch_snp_financial()이 만드는 annual_highlight(오래된순
+# 정렬, is_estimate로 실측/추정 구분)를 '매출액-5'(5년 전 실측)~'매출액+3'
+# (3년 후 추정) 같은 컬럼명으로 펼쳐서 저장한다. 컬럼명에 한글·+·-가 섞여
+# 있어 PostgreSQL에서 큰따옴표로 감싼 식별자(quoted identifier)가 필요하다.
+_ANNUAL_METRICS = (("revenue", "매출액"), ("op_profit", "영업이익"), ("net_profit", "당기순이익"))
+_ANNUAL_PAST_OFFSETS = (-5, -4, -3, -2, -1)   # 실측, 오래된 것부터
+_ANNUAL_FUTURE_OFFSETS = (1, 2, 3)             # 추정, 가까운 미래부터
+
+
+def _offset_suffix(offset: int) -> str:
+    return str(offset) if offset < 0 else f"+{offset}"
+
+
+_ANNUAL_COLUMNS = [
+    f"{label}{_offset_suffix(o)}"
+    for _, label in _ANNUAL_METRICS
+    for o in (*_ANNUAL_PAST_OFFSETS, *_ANNUAL_FUTURE_OFFSETS)
+]
+
+
+def _annual_offset_values(annual_highlight: Optional[list]) -> dict:
+    """annual_highlight(실측+추정, 오래된순 정렬)를 '매출액-5'..'당기순이익+3'
+    24개 컬럼명 -> 값 dict로 변환한다. 실측은 가장 최근 실적이 -1이 되도록
+    뒤에서부터, 추정은 가장 가까운 미래가 +1이 되도록 앞에서부터 채운다.
+    데이터가 5개년/3개년보다 적으면(소형주·신규상장 등) 먼 과거·먼 미래 쪽
+    컬럼은 자연히 비운다(조용히 지어내지 않는다는 기존 원칙과 동일) — 예를
+    들어 실측이 3개년뿐이면 -3,-2,-1만 채우고 -5,-4는 비워둔다."""
+    out: dict = {}
+    if not annual_highlight:
+        return out
+
+    actual = [r for r in annual_highlight if not r.get("is_estimate")][-len(_ANNUAL_PAST_OFFSETS):]
+    est = [r for r in annual_highlight if r.get("is_estimate")][:len(_ANNUAL_FUTURE_OFFSETS)]
+
+    n = len(actual)
+    for i, row in enumerate(actual):
+        offset = -(n - i)
+        for metric, label in _ANNUAL_METRICS:
+            out[f"{label}{_offset_suffix(offset)}"] = row.get(metric)
+
+    for i, row in enumerate(est):
+        offset = i + 1
+        for metric, label in _ANNUAL_METRICS:
+            out[f"{label}{_offset_suffix(offset)}"] = row.get(metric)
+
+    return out
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analysis_history (
     id SERIAL PRIMARY KEY,
@@ -67,7 +116,10 @@ ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS financial_stability_score 
 -- 성장점수/가치점수 기능 자체를 제거하기로 해서(사용자 확정) 컬럼도 드롭한다.
 ALTER TABLE analysis_history DROP COLUMN IF EXISTS growth_score;
 ALTER TABLE analysis_history DROP COLUMN IF EXISTS value_score;
-"""
+""" + "\n".join(
+    f'ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS "{col}" DOUBLE PRECISION;'
+    for col in _ANNUAL_COLUMNS
+) + "\n"
 
 
 def is_enabled() -> bool:
@@ -98,7 +150,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             scenario_consistency: Optional[dict] = None, regenerated: bool = False,
             report: Optional[str] = None,
             investment_summary: Optional[str] = None,
-            stability: Optional[dict] = None) -> None:
+            stability: Optional[dict] = None,
+            annual_highlight: Optional[list] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
@@ -107,18 +160,23 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
     valuation = (invest_point or {}).get("valuation", {})
     earnings_stability = (stability or {}).get("earnings") or {}
     financial_stability = (stability or {}).get("financial") or {}
+    annual_vals = _annual_offset_values(annual_highlight)
+    annual_col_sql = ", ".join(f'"{c}"' for c in _ANNUAL_COLUMNS)
+    annual_placeholders = ", ".join(["%s"] * len(_ANNUAL_COLUMNS))
     conn = _connect()
     try:
         _ensure_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO analysis_history
+                f"""INSERT INTO analysis_history
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
                     citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
                     regenerated, report, investment_summary,
-                    earnings_stability_score, financial_stability_score)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    earnings_stability_score, financial_stability_score,
+                    {annual_col_sql})
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           {annual_placeholders})""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
                  bool(valuation.get("signal")), valuation.get("band_position"),
@@ -128,7 +186,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
                  bool(regenerated), report, investment_summary,
-                 earnings_stability.get("score"), financial_stability.get("score")),
+                 earnings_stability.get("score"), financial_stability.get("score"),
+                 *[annual_vals.get(c) for c in _ANNUAL_COLUMNS]),
             )
         conn.commit()
     finally:
