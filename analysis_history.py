@@ -42,7 +42,11 @@ import psycopg2.extras
 # 정렬, is_estimate로 실측/추정 구분)를 '매출액-5'(5년 전 실측)~'매출액+3'
 # (3년 후 추정) 같은 컬럼명으로 펼쳐서 저장한다. 컬럼명에 한글·+·-가 섞여
 # 있어 PostgreSQL에서 큰따옴표로 감싼 식별자(quoted identifier)가 필요하다.
-_ANNUAL_METRICS = (("revenue", "매출액"), ("op_profit", "영업이익"), ("net_profit", "당기순이익"))
+# DPS(현금DPS, 배당)만 단위가 원이고 나머지 3개는 억원이지만(fnguide_sources
+# 참조), 여기서는 단위 변환 없이 소스 원값을 그대로 저장한다 — 컬럼명(DPS)
+# 자체가 단위 구분 표시 역할을 한다.
+_ANNUAL_METRICS = (("revenue", "매출액"), ("op_profit", "영업이익"),
+                   ("net_profit", "당기순이익"), ("dps", "DPS"))
 _ANNUAL_PAST_OFFSETS = (-5, -4, -3, -2, -1)   # 실측, 오래된 것부터
 _ANNUAL_FUTURE_OFFSETS = (1, 2, 3)             # 추정, 가까운 미래부터
 
@@ -59,8 +63,8 @@ _ANNUAL_COLUMNS = [
 
 
 def _annual_offset_values(annual_highlight: Optional[list]) -> dict:
-    """annual_highlight(실측+추정, 오래된순 정렬)를 '매출액-5'..'당기순이익+3'
-    24개 컬럼명 -> 값 dict로 변환한다. 실측은 가장 최근 실적이 -1이 되도록
+    """annual_highlight(실측+추정, 오래된순 정렬)를 '매출액-5'..'DPS+3'
+    32개 컬럼명 -> 값 dict로 변환한다. 실측은 가장 최근 실적이 -1이 되도록
     뒤에서부터, 추정은 가장 가까운 미래가 +1이 되도록 앞에서부터 채운다.
     데이터가 5개년/3개년보다 적으면(소형주·신규상장 등) 먼 과거·먼 미래 쪽
     컬럼은 자연히 비운다(조용히 지어내지 않는다는 기존 원칙과 동일) — 예를

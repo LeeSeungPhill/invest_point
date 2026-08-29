@@ -20,8 +20,9 @@ FnGuide(comp.fnguide.com) / WiseReport(navercomp.wisereport.co.kr) 직접 스크
       'consensus': {'opinion_label','target_price','eps','per','analyst_count','date'} | None,
       'source': 'FnGuide-SnpFinancial'|'FnGuide'|'WiseReport-fallback'|'none',
     }
-  각 highlight row: {period, is_estimate, revenue, op_profit, net_profit, op_margin, op_growth}
-  (단위: 억원)
+  annual_highlight row(getSnpFinancial): {period, is_estimate, revenue, op_profit,
+    net_profit, dps, op_margin, op_growth}
+  (단위: revenue/op_profit/net_profit는 억원, dps만 원 — 착각 주의)
 
 안정성: 개별 하위 수집 단계는 각각 try/except로 감싸 부분 실패해도 나머지는 반환한다
 (파이프라인 안정성 검증의 취지와 동일 — 전부 실패해야 빈 결과).
@@ -568,7 +569,11 @@ def _fetch_snp_financial(code: str, *, freq_typ: str = "Y", consol_typ: str = "M
         타 지표로 교차검증 완료) — CompanyInfo/Information 페이지(제품비중)와
         달리 여기는 코드 무관 고정 응답 문제가 없다.
       - 페이지 자체에 "단위 : 억원, %, 배, 주"라고 명시돼 있어 추가 단위 환산이
-        필요 없다(기존 cf1002/annual_highlight와 동일 단위)."""
+        필요 없다(기존 cf1002/annual_highlight와 동일 단위). 단, '현금DPS' 행만
+        예외로 응답 JSON 자체에 "UNIT": "(원)"이 붙어 있다 — 매출액/영업이익/
+        당기순이익은 억원 단위지만 DPS는 원 단위이므로 절대 억원으로 착각해
+        환산하면 안 된다(실측 확인: 매출액 VAL1=11950.36↔억원, DPS VAL1=600.00
+        ↔원, 같은 스케일로 보이면 명백히 틀린 것)."""
     params = {"cmp_cd": code, "consol_typ": consol_typ, "freq_typ": freq_typ}
     r = _request("GET", "https://wcomp.fnguide.com/CompanyInfo/getSnpFinancial",
                  headers=_WCOMP_HDR, params=params, timeout=12, retries=2)
@@ -580,6 +585,7 @@ def _fetch_snp_financial(code: str, *, freq_typ: str = "Y", consol_typ: str = "M
     revenue_row = rows_by_name.get("매출액") or {}
     op_row = rows_by_name.get("영업이익(발표기준)") or rows_by_name.get("영업이익") or {}
     ni_row = rows_by_name.get("당기순이익") or {}
+    dps_row = rows_by_name.get("현금DPS") or {}
 
     def _val(row: dict, cd: str) -> Optional[float]:
         raw = row.get(cd)
@@ -596,11 +602,12 @@ def _fetch_snp_financial(code: str, *, freq_typ: str = "Y", consol_typ: str = "M
         if not cd or not period:
             continue
         rev, op, ni = _val(revenue_row, cd), _val(op_row, cd), _val(ni_row, cd)
-        if rev is None and op is None and ni is None:
+        dps = _val(dps_row, cd)
+        if rev is None and op is None and ni is None and dps is None:
             continue
         rows.append({
             "period": period, "is_estimate": h.get("EP_CHK") == "E",
-            "revenue": rev, "op_profit": op, "net_profit": ni,
+            "revenue": rev, "op_profit": op, "net_profit": ni, "dps": dps,
             "op_margin": round(op / rev * 100, 1) if op is not None and rev else None,
         })
     rows.sort(key=lambda r: r["period"])
