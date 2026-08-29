@@ -1,14 +1,13 @@
 """
 weekly_batch.py
 ================
-보유 종목(stockBalance_stock_balance)을 대상으로 mvp_graph.run()을 순차 실행하는
+투자관리 종목(invest_mng)을 대상으로 mvp_graph.run()을 순차 실행하는
 주간 배치. 매주 일요일 1회 cron으로 기동하는 것을 전제로 한다 — 스케줄('언제')은
 cron(또는 이 스크립트를 감싸는 쉘 스크립트)이 담당하고, 이 파일은 '실행되면
 무엇을 할지'만 담당한다.
 
-대상 종목 선정: stockBalance_stock_balance에서 보유 처리 중(proc_yn='Y')이고
-매수금액이 있는(purchase_amount > 0) 6자리 종목코드를 종목명 기준 중복 제거해
-가져온다. 이 테이블에는 상품유형 컬럼이 없어 ETF/ETN은 종목명 브랜드 접두사로
+대상 종목 선정: invest_mng 체크일자(check_dt)가 1주일 이전 6자리 종목코드를 종목명 기준 중복 제거해 가져온다.
+이 테이블에는 상품유형 컬럼이 없어 ETF/ETN은 종목명 브랜드 접두사로
 걸러낸다(_is_etf_name). 종목별 실행은 서로 독립적으로 예외 처리되어 한 종목의
 수집/분석 실패가 나머지 종목 실행을 막지 않는다. mvp_graph의 3단계(analysis_history
 저장)·4단계(투자포인트 요약) 로직이 종목별 실행 안에서 그대로 재사용되므로 이번
@@ -25,6 +24,8 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
+from datetime import timedelta
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -47,7 +48,7 @@ log = logging.getLogger("weekly_batch")
 # 종목 간 호출 간격(초) — DART/네이버/FnGuide 등 외부 소스에 대한 배치성 부하 완화
 INTER_STOCK_PAUSE_SEC = 5
 
-# 국내 주요 ETF/ETN 브랜드 접두사 — stockBalance_stock_balance에는 상품유형 컬럼이
+# 국내 주요 ETF/ETN 브랜드 접두사 — invest_mng 상품유형 컬럼이
 # 없어 종목명 패턴으로 배제한다. 새 브랜드가 생기면 이 목록에 추가한다.
 _ETF_NAME_PREFIXES = (
     "KODEX", "TIGER", "KBSTAR", "ARIRANG", "HANARO", "KINDEX", "KOSEF", "SOL",
@@ -77,15 +78,15 @@ def _connect():
 
 
 def list_target_stocks() -> list[dict]:
-    """보유 처리 중(proc_yn='Y') & 매수금액>0 & 6자리 종목코드, ETF 제외."""
+    """체크일자 7일 이전 & 6자리 종목코드 & proc_yn = 'Y', ETF 제외."""
     conn = _connect()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                'SELECT code, name FROM public."stockBalance_stock_balance" '
-                "WHERE proc_yn = %s AND purchase_amount > 0 AND length(code) = 6 "
+                'SELECT code, name FROM public.invest_mng '
+                "WHERE check_dt < %s AND length(code) = 6 AND proc_yn = 'Y' "
                 "GROUP BY code, name ORDER BY code",
-                ("Y",),
+                ((datetime.now() - timedelta(days=7)).strftime("%Y%m%d"),),
             )
             rows = cur.fetchall()
         return [{"stock_code": r["code"], "corp_name": r["name"]}
@@ -125,7 +126,7 @@ def run_batch(limit: int | None = None) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="보유 종목(비-ETF) 대상 주간 mvp_graph 배치")
+    parser = argparse.ArgumentParser(description="투자관리 종목(비-ETF) 대상 주간 mvp_graph 배치")
     parser.add_argument("--limit", type=int, default=None, help="테스트용: 앞 N종목만 실행")
     args = parser.parse_args()
     run_batch(limit=args.limit)
