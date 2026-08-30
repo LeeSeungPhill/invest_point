@@ -24,8 +24,6 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
-from datetime import timedelta
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -78,15 +76,22 @@ def _connect():
 
 
 def list_target_stocks() -> list[dict]:
-    """체크일자 7일 이전 & 6자리 종목코드 & proc_yn = 'Y', ETF 제외."""
+    """6자리 종목코드 & proc_yn='Y' 이면서, analysis_history에 investment_summary가
+    채워진 이력이 있고 그 최근 run_at 일자가 7일 전보다 이전인 종목. ETF 제외."""
     conn = _connect()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                'SELECT code, name FROM public.invest_mng '
-                "WHERE check_dt < %s AND length(code) = 6 AND proc_yn = 'Y' "
-                "GROUP BY code, name ORDER BY code",
-                ((datetime.now() - timedelta(days=7)).strftime("%Y%m%d"),),
+                "SELECT m.code, m.name FROM public.invest_mng m "
+                "JOIN ("
+                "  SELECT stock_code, MAX(run_at) AS last_run_at "
+                "  FROM public.analysis_history "
+                "  WHERE investment_summary IS NOT NULL AND investment_summary != '' "
+                "  GROUP BY stock_code"
+                ") h ON h.stock_code = m.code "
+                "WHERE length(m.code) = 6 AND m.proc_yn = 'Y' "
+                "AND to_char(h.last_run_at, 'YYYYMMDD') < to_char(date_trunc('day', current_date - interval '7 day'), 'YYYYMMDD') "
+                "GROUP BY m.code, m.name ORDER BY m.code"
             )
             rows = cur.fetchall()
         return [{"stock_code": r["code"], "corp_name": r["name"]}
