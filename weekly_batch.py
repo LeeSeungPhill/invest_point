@@ -6,7 +6,7 @@ weekly_batch.py
 cron(또는 이 스크립트를 감싸는 쉘 스크립트)이 담당하고, 이 파일은 '실행되면
 무엇을 할지'만 담당한다.
 
-대상 종목 선정: invest_mng 체크일자(check_dt)가 1주일 이전 6자리 종목코드를 종목명 기준 중복 제거해 가져온다.
+대상 종목 선정: analysis_history에 investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 전보다 이전인 invest_mng 의 6자리 종목코드 & proc_yn='Y' 중복 제거해 가져온다.
 이 테이블에는 상품유형 컬럼이 없어 ETF/ETN은 종목명 브랜드 접두사로
 걸러낸다(_is_etf_name). 종목별 실행은 서로 독립적으로 예외 처리되어 한 종목의
 수집/분석 실패가 나머지 종목 실행을 막지 않는다. mvp_graph의 3단계(analysis_history
