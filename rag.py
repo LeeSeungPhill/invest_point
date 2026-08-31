@@ -105,12 +105,27 @@ def chunk_text(text: str, *, max_chars: int = 800, overlap: int = 120) -> list[C
 # ---------------------------------------------------------------------- #
 # 2) 임베딩 (Ollama, 로컬)
 # ---------------------------------------------------------------------- #
+def ollama_healthy(base_url: Optional[str] = None, timeout: float = 5.0) -> bool:
+    """Ollama 서버가 /api/tags에 정상 응답하는지 1회 확인. RAG fail-fast 판정용 —
+    죽어 있으면 호출부에서 이번 실행의 임베딩 단계를 통째로 건너뛴다."""
+    base = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+    try:
+        r = requests.get(f"{base}/api/tags", timeout=timeout)
+        r.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.warning("Ollama 헬스체크 실패(%s/api/tags): %s", base, e)
+        return False
+
+
 class OllamaEmbedder:
     def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None,
-                 timeout: int = 120):
+                 timeout: Optional[int] = None):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
         self.base = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
-        self.timeout = timeout
+        # 기본 30초 — 죽은 서버에 배치가 종목마다 오래 매달리지 않도록.
+        # 느리지만 살아있는 서버를 위해선 OLLAMA_EMBED_TIMEOUT로 늘릴 수 있다.
+        self.timeout = timeout if timeout is not None else int(os.getenv("OLLAMA_EMBED_TIMEOUT", "30"))
 
     def _post(self, path: str, payload: dict) -> dict:
         r = requests.post(f"{self.base}{path}", json=payload, timeout=self.timeout)

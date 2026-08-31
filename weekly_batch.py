@@ -120,6 +120,9 @@ def run_batch(limit: int | None = None) -> None:
             errs = result.get("errors") or []
             log.info("[%d/%d] %s(%s) 완료 — 경고 %d건%s", i, len(stocks), code, name,
                      len(errs), " 재생성됨" if result.get("regenerated") else "")
+            if result.get("llm_error"):
+                log.warning("[%d/%d] %s(%s) LLM 호출 에러: %s",
+                            i, len(stocks), code, name, result["llm_error"])
             ok += 1
         except Exception:  # noqa: BLE001 — 한 종목 실패가 배치 전체를 죽이면 안 됨
             log.exception("[%d/%d] %s(%s) 실패", i, len(stocks), code, name)

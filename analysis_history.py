@@ -1,7 +1,7 @@
 """
 analysis_history.py
 ====================
-3단계: 과거 분석 이력을 PostgreSQL(fund_risk_mng DB)에 저장하고, 다음 분석 때 참조한다.
+3단계: 과거 분석 이력을 fund_risk_mng DB에 저장하고, 다음 분석 때 참조한다.
 
 목적:
   - LLM이 '지난 분석 대비 개선/악화'를 실제 저장된 숫자로만 서술하게 한다
@@ -41,7 +41,7 @@ import psycopg2.extras
 # fnguide_sources._fetch_snp_financial()이 만드는 annual_highlight(오래된순
 # 정렬, is_estimate로 실측/추정 구분)를 '매출액-5'(5년 전 실측)~'매출액+3'
 # (3년 후 추정) 같은 컬럼명으로 펼쳐서 저장한다. 컬럼명에 한글·+·-가 섞여
-# 있어 PostgreSQL에서 큰따옴표로 감싼 식별자(quoted identifier)가 필요하다.
+# 있어 큰따옴표로 감싼 식별자(quoted identifier)가 필요하다.
 # DPS(현금DPS, 배당)만 단위가 원이고 나머지 3개는 억원이지만(fnguide_sources
 # 참조), 여기서는 단위 변환 없이 소스 원값을 그대로 저장한다 — 컬럼명(DPS)
 # 자체가 단위 구분 표시 역할을 한다.
@@ -90,42 +90,6 @@ def _annual_offset_values(annual_highlight: Optional[list]) -> dict:
     return out
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS analysis_history (
-    id SERIAL PRIMARY KEY,
-    stock_code TEXT NOT NULL,
-    corp_name TEXT,
-    run_at TIMESTAMP NOT NULL,
-    report_nm TEXT,
-    rcept_dt TEXT,
-    growth_trend TEXT,
-    op_yoy_forward DOUBLE PRECISION,
-    value_signal BOOLEAN,
-    band_position DOUBLE PRECISION,
-    target_upside_pct DOUBLE PRECISION,
-    price DOUBLE PRECISION,
-    citation_verdict TEXT,
-    avg_grounding DOUBLE PRECISION,
-    cross_check_ok BOOLEAN,
-    scenario_verdict TEXT,
-    regenerated BOOLEAN,
-    report TEXT,
-    investment_summary TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hist_stock_time ON analysis_history(stock_code, run_at DESC);
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS investment_summary TEXT;
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS avg_grounding DOUBLE PRECISION;
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS earnings_stability_score INTEGER;
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS financial_stability_score INTEGER;
--- 성장점수/가치점수 기능 자체를 제거하기로 해서(사용자 확정) 컬럼도 드롭한다.
-ALTER TABLE analysis_history DROP COLUMN IF EXISTS growth_score;
-ALTER TABLE analysis_history DROP COLUMN IF EXISTS value_score;
-""" + "\n".join(
-    f'ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS "{col}" DOUBLE PRECISION;'
-    for col in _ANNUAL_COLUMNS
-) + "\n"
-
-
 def is_enabled() -> bool:
     return os.getenv("DISABLE_HISTORY", "0") != "1"
 
@@ -139,12 +103,6 @@ def _connect():
         password=os.getenv("PG_PASSWORD", ""),
         connect_timeout=5,
     )
-
-
-def _ensure_schema(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(_SCHEMA)
-    conn.commit()
 
 
 def save_run(*, stock_code: str, corp_name: Optional[str] = None,
@@ -169,7 +127,6 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
     annual_placeholders = ", ".join(["%s"] * len(_ANNUAL_COLUMNS))
     conn = _connect()
     try:
-        _ensure_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
                 f"""INSERT INTO analysis_history
@@ -204,7 +161,6 @@ def get_recent(stock_code: str, *, limit: int = 5) -> list[dict]:
         return []
     conn = _connect()
     try:
-        _ensure_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT * FROM analysis_history WHERE stock_code=%s "

@@ -11,7 +11,7 @@ mvp_graph.py
        실제로 같은 방향을 말하는지 + 제공되지 않은 파생 수치를 지어내지 않았는지
        검증(scenario_check.py)한다. 불일치 발견 시 1회 자동 재생성 후 그래도
        남아있으면 최종 결과에 경고를 남긴다(무한 재시도 금지). 또한 같은 종목의
-       과거 분석 결과를 PostgreSQL에 저장·조회해(analysis_history.py) LLM이
+       과거 분석 결과를 DB에 저장·조회해(analysis_history.py) LLM이
        '지난 분석 대비' 서술을 실제 과거 숫자로만 하게 하고, 근거 수치는 그대로인데
        판단만 뒤집힌 경우를 참고 신호(history_drift)로 남긴다.
 4단계: 컨센서스(자체 집계 + FnGuide, 코드 계산값)와 3단계에서 검증까지 끝난 LLM
@@ -37,7 +37,7 @@ mvp_graph.py
                       # ollama면 추가 키 불필요(로컬). 자세한 설정은 llm_backend.py
 
 실행:
-  python mvp_graph.py 112610      # 예: CS WIND
+  python mvp_graph.py 003670      # 예: 포스코퓨처엠
 """
 
 from __future__ import annotations
@@ -99,10 +99,12 @@ class AnalysisState(TypedDict, total=False):
     citation_report: dict       # 인용 품질 검증 결과(청크 그라운딩)
     scenario_consistency: dict  # 3단계: 시나리오 방향/파생수치 일관성 검증 결과
     regenerated: bool           # 1회 자동 재생성이 실제로 발생했는지
-    history: list               # 3단계: 같은 종목의 과거 분석 이력(최신순, PostgreSQL)
+    history: list               # 3단계: 같은 종목의 과거 분석 이력(최신순)
     history_drift: dict         # 3단계: 과거 대비 '근거 수치는 그대로인데 판단만 뒤집힘' 참고신호
     report: str                 # 최종 LLM 리포트
     investment_summary: str     # 4단계: 컨센서스 + 리포트 결합 투자포인트 요약
+    rag_skip: bool              # Ollama 헬스체크 실패 시 이번 실행 임베딩 검색 생략(run에서 주입)
+    llm_error: str              # analyze 단계(import/init/llm) 에러 메시지를 최상위로 노출
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
     errors: Annotated[list, operator.add]
     sources_status: Annotated[dict, lambda a, b: {**(a or {}), **(b or {})}]
@@ -335,7 +337,7 @@ def cross_check_sources(state: AnalysisState) -> AnalysisState:
 
 
 def load_history(state: AnalysisState) -> AnalysisState:
-    """3단계: 같은 종목의 과거 분석 이력(PostgreSQL)을 불러와 analyze 프롬프트에
+    """3단계: 같은 종목의 과거 분석 이력을 불러와 analyze 프롬프트에
     참조 자료로 제공한다. DB 접속 불가 시에도 그래프는 계속 진행(빈 이력 취급)."""
     if not state.get("stock_code"):
         return {"sources_status": {"history": "skip"}}
@@ -440,7 +442,12 @@ def rag_retrieve(state: AnalysisState) -> AnalysisState:
     n_chunks = 0
     rag_error: Optional[Exception] = None
 
-    if body:
+    if body and state.get("rag_skip"):
+        rag_error = RuntimeError(
+            "Ollama 헬스체크 실패로 이번 실행은 임베딩 검색을 건너뜀(RAG fail-fast). "
+            "'사업의 개요' 합성 청크만 근거로 사용.")
+        log.warning("rag_retrieve: %s", rag_error)
+    elif body:
         try:
             from rag import chunk_text, Retriever
             chunks = chunk_text(body)
@@ -937,17 +944,42 @@ def build_graph():
 
 def run(stock_code: str) -> AnalysisState:
     graph = build_graph()
-    final = graph.invoke({"stock_code": stock_code, "errors": []})
+    init: AnalysisState = {"stock_code": stock_code, "errors": []}
+
+    # Ollama fail-fast: /api/tags 헬스체크 1회. 죽어 있으면 이번 실행 내내
+    # rag_retrieve가 임베딩을 시도하지 않도록 플래그를 심는다(종목마다 타임아웃
+    # 대기로 배치가 기어가는 것을 방지).
+    try:
+        from rag import ollama_healthy
+        if not ollama_healthy():
+            log.warning("Ollama 미응답 — 이번 실행은 RAG(임베딩 검색)를 건너뜁니다.")
+            init["rag_skip"] = True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Ollama 헬스체크 예외 — RAG 건너뜀: %s", e)
+        init["rag_skip"] = True
+
+    final = graph.invoke(init)
+
+    # analyze 단계(import/init/llm) 에러를 최상위 키로 노출 — 호출부가
+    # errors 리스트를 파싱하지 않고도 LLM 호출 실패 여부를 알 수 있게.
+    llm_error = next(
+        (msg for msg in (final.get("errors") or []) if str(msg).startswith("[analyze(")),
+        None,
+    )
+    if llm_error:
+        final["llm_error"] = llm_error
     return final
 
 
 if __name__ == "__main__":
-    code = sys.argv[1] if len(sys.argv) > 1 else "112610"
+    code = sys.argv[1] if len(sys.argv) > 1 else "003670"
     result = run(code)
 
     print("\n" + "=" * 70)
     print(f"종목: {result.get('corp_name')} ({code})  근거: {result.get('report_nm')}")
     print(f"소스 상태: {result.get('sources_status', {})}  | RAG 청크: {result.get('n_chunks', 0)}")
+    if result.get("llm_error"):
+        print(f" ⚠️  LLM 호출 에러: {result['llm_error']}")
     print("=" * 70)
 
     ip = result.get("invest_point")
