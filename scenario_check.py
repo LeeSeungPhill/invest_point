@@ -50,6 +50,40 @@ def _sections(report: str) -> dict:
     return {m.group(1).strip(): m.group(2).strip() for m in _SECTION.finditer(report)}
 
 
+# 실측 사례(336260, 2026-09-06 06:57): LLM 호출이 중간에 끊겨 report가 34자
+# ("[핵심 이슈]\n- 주요 매출처 중 삼천리ES(37.0%)와"에서 그대로 잘림)만 저장됐다.
+# 남은 6개 절이 통째로 비어 있었는데도, check_trend/check_signal 등은 해당 절이
+# 없으면 그냥 None(판단 보류)을 반환해 '모순 없음'으로 통과시켜버렸다 — 이 체크들은
+# "말한 내용이 정량 지표와 맞는지"만 보지 "충분히 말했는지"는 보지 않기 때문이다.
+# check_completeness는 내용의 정확성이 아니라 응답이 끝까지 채워졌는지만 본다.
+_MIN_REPORT_LEN = 100          # 정상 리포트는 절이 성기어도(자료상 확인 불가 등) 이보다 훨씬 길다
+_MIN_SECTION_COUNT = 4         # SECTION_TAGS 7개 중 최소 이 개수는 파싱돼야 함
+# simul_server.py 투자관리입력 화면이 실제로 쓰는 3개 절 — 이 중 하나라도
+# 통째로 비면(0자) 화면에 빈 칸으로 보이므로 특히 엄격히 본다.
+_REQUIRED_SECTIONS = ("핵심 이슈", "투자포인트", "리스크")
+_MIN_REQUIRED_SECTION_LEN = 5  # "자료상 확인 불가"(9자)류의 정상 최소 응답은 통과시키는 하한
+
+
+def check_completeness(report: str, report_sections: dict) -> Optional[dict]:
+    """리포트가 중간에 끊기거나(네트워크/타임아웃 등) 필수 절을 하나도 채우지
+    못한 채 저장되는 경우를 잡는다. 다른 check_* 함수들과 달리 '옳은 말을 했는지'가
+    아니라 '충분히 채워졌는지'만 판단한다."""
+    problems = []
+    report_len = len(report or "")
+    if report_len < _MIN_REPORT_LEN:
+        problems.append(f"리포트 전체 길이 {report_len}자(최소 {_MIN_REPORT_LEN}자 미만) — 응답이 중간에 끊겼을 가능성")
+    if len(report_sections) < _MIN_SECTION_COUNT:
+        problems.append(f"파싱된 절 {len(report_sections)}/{len(SECTION_TAGS)}개(최소 {_MIN_SECTION_COUNT}개 미만)")
+    for tag in _REQUIRED_SECTIONS:
+        content = report_sections.get(tag, "")
+        if len(content) < _MIN_REQUIRED_SECTION_LEN:
+            problems.append(f"[{tag}] 절이 비어있거나 너무 짧음({len(content)}자)")
+
+    if not problems:
+        return None
+    return {"match": False, "problems": problems}
+
+
 def check_trend(report_sections: dict, expected_trend: Optional[str]) -> Optional[dict]:
     if not expected_trend:
         return None
@@ -401,6 +435,7 @@ def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
     growth = (invest_point or {}).get("growth", {})
     valuation = (invest_point or {}).get("valuation", {})
 
+    completeness_chk = check_completeness(report, sections)
     trend_chk = check_trend(sections, growth.get("trend"))
     signal_chk = check_signal(sections, valuation.get("signal"))
     band_chk = check_band_threshold(sections, valuation)
@@ -410,6 +445,11 @@ def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
                  + find_scale_implausible_numbers(sections, revenue_scale))
 
     problems = []
+    # 완전성 문제는 다른 모든 체크보다 먼저 본다 — 응답이 중간에 끊긴 경우
+    # 대부분의 절이 비어 있어 아래 다른 체크들은 애초에 판단할 근거가 없다(None
+    # 반환 = 모순 없음으로 오인될 수 있음). 완전성부터 걸러야 재생성이 확실히 트리거된다.
+    if completeness_chk and not completeness_chk["match"]:
+        problems.append("응답 불완전: " + "; ".join(completeness_chk["problems"]))
     if trend_chk and not trend_chk["match"]:
         problems.append(f"성장 판단 불일치(기대: {trend_chk['expected']})")
     if signal_chk and not signal_chk["match"]:
@@ -425,6 +465,7 @@ def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
 
     consistent = not problems
     return {
+        "completeness_check": completeness_chk,
         "trend_check": trend_chk,
         "signal_check": signal_chk,
         "band_check": band_chk,
