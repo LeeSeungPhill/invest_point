@@ -6,7 +6,7 @@ weekly_batch.py
 cron(또는 이 스크립트를 감싸는 쉘 스크립트)이 담당하고, 이 파일은 '실행되면
 무엇을 할지'만 담당한다.
 
-대상 종목 선정: analysis_history에 investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 전보다 이전인 invest_mng 의 6자리 종목코드 & proc_yn='Y' 중복 제거해 가져온다.
+대상 종목 선정: analysis_history에 investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 invest_mng 의 6자리 종목코드 & proc_yn='Y' 중복 제거해 가져온다.
 이 테이블에는 상품유형 컬럼이 없어 ETF/ETN은 종목명 브랜드 접두사로
 걸러낸다(_is_etf_name). 종목별 실행은 서로 독립적으로 예외 처리되어 한 종목의
 수집/분석 실패가 나머지 종목 실행을 막지 않는다. mvp_graph의 3단계(analysis_history
@@ -77,7 +77,12 @@ def _connect():
 
 def list_target_stocks() -> list[dict]:
     """6자리 종목코드 & proc_yn='Y' 이면서, analysis_history에 investment_summary가
-    채워진 이력이 있고 그 최근 run_at 일자가 7일 전보다 이전인 종목. ETF 제외."""
+    채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 종목. ETF 제외.
+
+    날짜를 'YYYYMMDD'로 자른 뒤 비교하므로 '<=' 이어야 매주 정확히 7일 간격
+    cron으로 돌 때도 경계에서 스킵되지 않는다 — '<'였을 때는 '정확히 7일 지남'
+    케이스가 매번 거짓이 되어 한 번 실행되면 다음 주는 항상 스킵되고 그다음 주
+    (14일 뒤)에야 다시 실행되는, '주간' 배치가 사실상 격주로 도는 버그가 있었다."""
     conn = _connect()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -90,7 +95,7 @@ def list_target_stocks() -> list[dict]:
                 "  GROUP BY stock_code"
                 ") h ON h.stock_code = m.code "
                 "WHERE length(m.code) = 6 AND m.proc_yn = 'Y' "
-                "AND to_char(h.last_run_at, 'YYYYMMDD') < to_char(date_trunc('day', current_date - interval '7 day'), 'YYYYMMDD') "
+                "AND to_char(h.last_run_at, 'YYYYMMDD') <= to_char(date_trunc('day', current_date - interval '7 day'), 'YYYYMMDD') "
                 "GROUP BY m.code, m.name ORDER BY m.code"
             )
             rows = cur.fetchall()
