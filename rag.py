@@ -123,9 +123,13 @@ class OllamaEmbedder:
                  timeout: Optional[int] = None):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
         self.base = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
-        # 기본 30초 — 죽은 서버에 배치가 종목마다 오래 매달리지 않도록.
-        # 느리지만 살아있는 서버를 위해선 OLLAMA_EMBED_TIMEOUT로 늘릴 수 있다.
-        self.timeout = timeout if timeout is not None else int(os.getenv("OLLAMA_EMBED_TIMEOUT", "30"))
+        # 기본 120초 — 원격/CPU Ollama에서 bge-m3 콜드 로드(다른 모델과 스왑)만으로도
+        # 수십 초가 걸린다. 죽은 서버는 아래 배치 조기중단으로 걸러내므로 넉넉히 잡는다.
+        # 필요하면 OLLAMA_EMBED_TIMEOUT로 조정.
+        self.timeout = timeout if timeout is not None else int(os.getenv("OLLAMA_EMBED_TIMEOUT", "120"))
+        # 한 번의 /api/embed에 담는 청크 수. 본문 전체(수백 개)를 한 요청으로 보내면
+        # 느린 서버에선 타임아웃하므로 작게 쪼갠다. OLLAMA_EMBED_BATCH로 조정.
+        self.batch = max(1, int(os.getenv("OLLAMA_EMBED_BATCH", "16")))
 
     def _post(self, path: str, payload: dict) -> dict:
         r = requests.post(f"{self.base}{path}", json=payload, timeout=self.timeout)
@@ -136,25 +140,40 @@ class OllamaEmbedder:
         r.raise_for_status()
         return r.json()
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, 1), dtype=np.float32)
-        # 신형 배치 엔드포인트 우선
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """한 배치를 /api/embed로 임베딩. 실패 시 구형 /api/embeddings 단건 폴백."""
         try:
             data = self._post("/api/embed", {"model": self.model, "input": texts})
             embs = data.get("embeddings")
             if embs:
-                return np.array(embs, dtype=np.float32)
+                return embs
+            logger.warning("/api/embed 응답에 embeddings 없음, 단건 폴백")
         except RuntimeError:
             raise  # 모델 없음(404): 명확한 안내를 그대로 올림
         except requests.RequestException as e:
             logger.warning("/api/embed 실패, 단건 폴백: %s", e)
 
-        # 구형 단건 엔드포인트 폴백
+        # 구형 단건 엔드포인트 폴백 — 첫 건에서 timeout/conn 오류가 나면 _post가
+        # 그대로 예외를 올리므로, 나머지 청크를 붙들지 않고 즉시 중단된다.
         out = []
         for t in texts:
             data = self._post("/api/embeddings", {"model": self.model, "prompt": t})
             out.append(data["embedding"])
+        return out
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, 1), dtype=np.float32)
+        out: list[list[float]] = []
+        total = (len(texts) + self.batch - 1) // self.batch
+        for bi, i in enumerate(range(0, len(texts), self.batch), 1):
+            try:
+                out.extend(self._embed_batch(texts[i:i + self.batch]))
+            except requests.RequestException as e:
+                # 한 배치가 네트워크/타임아웃으로 실패하면 이후 배치도 같은 이유로
+                # 실패한다. 배치마다 타임아웃을 반복해 몇 분씩 매달리지 않도록 중단.
+                logger.warning("임베딩 배치 %d/%d 실패, 이후 배치 중단: %s", bi, total, e)
+                raise
         return np.array(out, dtype=np.float32)
 
 
