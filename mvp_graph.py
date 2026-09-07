@@ -65,6 +65,7 @@ from scenario_check import SECTION_TAGS
 from industry_category import classify_industry
 import stability_score
 import analysis_history
+import telegram_alert
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -114,6 +115,19 @@ def _append_error(state: AnalysisState, where: str, exc: Exception) -> list:
     log.warning("노드 오류 %s: %s", where, exc)
     # reducer(operator.add)가 기존 리스트에 더해주므로 '추가분'만 반환
     return [f"[{where}] {type(exc).__name__}: {exc}"]
+
+
+def _alert_analyze_failure(state: AnalysisState, where: str, exc: Exception) -> None:
+    """analyze 노드(import/init/llm) 실패는 이번 실행이 리포트 없이 끝난다는 뜻이라
+    다른 노드 오류(뉴스/리서치 등 — 원래도 정상적으로 다운그레이드됨)와 달리 즉시
+    텔레그램으로 알린다(telegram_alert.py 참조). 알림 전송 실패 자체는 절대
+    파이프라인을 죽이면 안 되므로 telegram_alert.send_alert()가 내부에서 예외를
+    전부 삼킨다 — 여기서도 별도로 감싸지 않는다."""
+    telegram_alert.send_alert(
+        f"[invest_point] {where} 실패\n"
+        f"종목: {state.get('corp_name')}({state.get('stock_code')})\n"
+        f"{type(exc).__name__}: {exc}"
+    )
 
 
 # 클라이언트는 노드 간 공유 (corp_map 캐시 재사용)
@@ -621,6 +635,7 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         from langchain_core.messages import SystemMessage, HumanMessage
         from llm_backend import get_chat_model
     except ImportError as e:
+        _alert_analyze_failure(state, "analyze(import)", e)
         return {"errors": _append_error(state, "analyze(import)", e),
                 "report": "(LLM 백엔드 모듈/패키지 미설치)"}
 
@@ -630,6 +645,7 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
         # 실측됐다. 4000으로 여유를 둔다(그래도 비면 위의 빈 응답 처리가 잡아준다).
         llm = get_chat_model(temperature=0.2, max_tokens=4000)
     except Exception as e:  # noqa: BLE001
+        _alert_analyze_failure(state, "analyze(init)", e)
         return {"errors": _append_error(state, "analyze(init)", e),
                 "report": "(LLM 백엔드 초기화 실패 — LLM_BACKEND 설정 확인)"}
 
@@ -746,12 +762,13 @@ def _analyze_core(state: AnalysisState, *, feedback: Optional[dict] = None) -> A
             # 길어짐)에서 내부 추론만 하다 max_tokens를 다 써버려 최종 답변이 빈 문자열로
             # 오는 경우가 있다. 빈 문자열을 그대로 report로 넘기면 verify_scenario가
             # '검증 대상 없음(consistent=True)'로 잘못 통과시켜 실패가 성공처럼 보인다.
-            return {"errors": _append_error(
-                        state, "analyze(llm)",
-                        RuntimeError("LLM 응답이 비어 있음(추론만 하고 답변 미생성 가능성)")),
+            empty_exc = RuntimeError("LLM 응답이 비어 있음(추론만 하고 답변 미생성 가능성)")
+            _alert_analyze_failure(state, "analyze(llm)", empty_exc)
+            return {"errors": _append_error(state, "analyze(llm)", empty_exc),
                     "report": "(LLM 응답 비어있음 — 재시도 필요)"}
         return {"report": text, "history_drift": b.get("history_drift")}
     except Exception as e:  # noqa: BLE001  (네트워크/키 등 광범위)
+        _alert_analyze_failure(state, "analyze(llm)", e)
         return {"errors": _append_error(state, "analyze(llm)", e),
                 "report": "(LLM 호출 실패)"}
 
