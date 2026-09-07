@@ -86,7 +86,7 @@ def list_target_stocks() -> list[dict]:
                 "JOIN ("
                 "  SELECT stock_code, MAX(run_at) AS last_run_at "
                 "  FROM public.analysis_history "
-                "  WHERE investment_summary IS NOT NULL AND investment_summary != '' "
+                "  WHERE investment_summary IS NOT NULL AND investment_summary NOT LIKE '%미생성%' "
                 "  GROUP BY stock_code"
                 ") h ON h.stock_code = m.code "
                 "WHERE length(m.code) = 6 AND m.proc_yn = 'Y' "
