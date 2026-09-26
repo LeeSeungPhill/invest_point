@@ -336,6 +336,48 @@ def fetch_naver_price(stock_code: str, *, cache_ttl: int = 600) -> dict:
 
 
 # ---------------------------------------------------------------------- #
+# KRX KIND 상장법인목록 — 상장일(상장 후 경과년수 판단용)
+#   DART company.json의 est_dt는 '법인 설립일'이라 상장일과 다르고, 네이버
+#   모바일 API(basic/integration)에도 상장일 필드가 없어 이 공개 목록이 유일한
+#   실측 경로다. Batch/fnguidePerformbot.py가 종목코드 매핑을 만들 때 쓰는
+#   것과 동일한 다운로드 URL(개인 리서치 목적, 상업적 재배포 아님).
+# ---------------------------------------------------------------------- #
+def fetch_listing_age(stock_code: str, *, cache_ttl: int = 7 * 86400) -> dict:
+    """상장일과 상장 후 경과년수. 상장일은 사실상 불변인 정적 데이터라 전체
+    상장사 목록(2700여개)을 통째로 캐시해 재사용한다(종목별 개별 다운로드가
+    아니라 프로세스 전체에서 사실상 한 번만 받는다). 조회 실패/미상장 종목이면
+    빈 dict를 반환한다(다른 fetch_* 함수와 달리 예외를 던지지 않음 — 이 값은
+    가치 시그널의 보조 조건 중 하나일 뿐 가격 데이터 자체를 막을 이유가 없다)."""
+    cached = _cache_get("krx_listed_dates", cache_ttl)
+    if cached is None:
+        try:
+            r = _request("GET", "http://kind.krx.co.kr/corpgeneral/corpList.do",
+                         params={"method": "download"}, timeout=20)
+            r.encoding = "EUC-KR"
+            import pandas as pd
+            from io import StringIO
+            df = pd.read_html(StringIO(r.text), header=0)[0]
+            df.columns = ["name", "market", "code", "industry", "product",
+                          "listed_date", "settle_month", "ceo", "homepage", "region"]
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            cached = dict(zip(df["code"], df["listed_date"].astype(str)))
+            _cache_put("krx_listed_dates", cached)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("KRX 상장법인목록 조회 실패: %s", e)
+            return {}
+
+    listed_date = cached.get(stock_code.zfill(6))
+    if not listed_date:
+        return {}
+    try:
+        from datetime import date, datetime
+        d = datetime.strptime(listed_date, "%Y-%m-%d").date()
+    except ValueError:
+        return {}
+    return {"listed_date": listed_date, "years_listed": round((date.today() - d).days / 365.25, 1)}
+
+
+# ---------------------------------------------------------------------- #
 # 네이버 종목분석 > Financial Summary (출처: navercomp.wisereport.co.kr / FnGuide)
 #   연간/분기/예상((E)) 매출액·영업이익·당기순이익. 단위: 억원.
 #   주의: 데이터 저작권은 FnGuide. 자동수집/DB화 ToS 리스크는 사용자 책임.

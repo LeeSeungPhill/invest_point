@@ -19,6 +19,17 @@ mvp_graph.py
        '투자포인트 요약'을 만든다(build_investment_summary). 새 숫자를 만들지 않고
        이미 검증된 컨센서스 수치 + 리포트 문장을 재구성만 하므로 추가 LLM 호출이나
        환각 위험이 없다. 결과는 analysis_history에도 함께 저장된다.
+5단계: invest_point.build_value_signal()의 quality_signal(상장 5년+ & 매출 지속
+       상승 & 최근 실적 상승 & 목표가 상승여력 50%+)이 True인 종목만, 가치주
+       점검 체크리스트(업황 사이클/구조적 쇠퇴 신호/경쟁 구도/매크로 민감도 +
+       한경컨센서스 추정치 리비전·커버리지·편차)를 LLM으로 정리해
+       invest_mng.value_invest에 저장한다(check_value_investment). 리비전
+       통계는 value_investment_check.py가 코드로 계산하고, 산업/경쟁 관련
+       정성 판단은 이미 수집된 사업보고서 RAG 청크에 실제 근거가 있을 때만
+       [Cxxx] 인용과 함께 서술하게 한다(analyze()와 같은 인용 규율). 자본시장
+       연구원/산업연구원/KDI/관세청 등 macro·정책 자료는 구조화 API가 없어
+       자동화 대상에서 제외했다 — 해당 항목은 프롬프트가 '자료상 확인 불가'로
+       쓰게 한다.
 
 설계 원칙(앞선 검토와 일관):
   - LLM에게 매출을 '포인트 숫자'로 예측시키지 않는다.
@@ -66,6 +77,8 @@ from industry_category import classify_industry
 import stability_score
 import analysis_history
 import telegram_alert
+import invest_mng_store
+import value_investment_check
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -104,6 +117,7 @@ class AnalysisState(TypedDict, total=False):
     history_drift: dict         # 3단계: 과거 대비 '근거 수치는 그대로인데 판단만 뒤집힘' 참고신호
     report: str                 # 최종 LLM 리포트
     investment_summary: str     # 4단계: 컨센서스 + 리포트 결합 투자포인트 요약
+    value_investment: str       # 5단계: quality_signal True인 종목만 — 가치주 점검 결과
     rag_skip: bool              # Ollama 헬스체크 실패 시 이번 실행 임베딩 검색 생략(run에서 주입)
     llm_error: str              # analyze 단계(import/init/llm) 에러 메시지를 최상위로 노출
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
@@ -239,12 +253,17 @@ def fetch_fnguide(state: AnalysisState) -> AnalysisState:
 
 
 def fetch_price(state: AnalysisState) -> AnalysisState:
-    """현재가·52주 밴드·PER/PBR·컨센서스 목표주가(가치 관점 판단용)."""
+    """현재가·52주 밴드·PER/PBR·컨센서스 목표주가(가치 관점 판단용) + 상장 후
+    경과년수(연간 가치 시그널의 '상장 5년 이상' 보조 조건에 사용)."""
     if not state.get("stock_code"):
         return {"sources_status": {"price": "skip"}}
     try:
-        from external_sources import fetch_naver_price
+        from external_sources import fetch_naver_price, fetch_listing_age
         price = fetch_naver_price(state["stock_code"])
+        try:
+            price.update(fetch_listing_age(state["stock_code"]))
+        except Exception as e:  # noqa: BLE001  (보조 정보라 실패해도 price 자체는 유효)
+            log.warning("상장일 조회 실패(%s): %s", state["stock_code"], e)
         return {"price": price, "sources_status": {"price": "ok"}}
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "fetch_price", e),
@@ -383,6 +402,91 @@ def save_history(state: AnalysisState) -> AnalysisState:
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
     return {}
+
+
+_VALUE_CHECK_SYSTEM = (
+    "너는 가치투자 관점에서 종목을 점검하는 애널리스트다. 목표는 '이 종목이 싼 "
+    "이유가 일시적인가 구조적인가'와 '싼 상태를 끝낼 촉매가 있는가'를 판단하는 "
+    "것이다. 아래 제공된 자료만 근거로 삼고, 추론 과정은 출력하지 말고 결과만 "
+    "한국어로 써라. 규칙(엄수):\n"
+    "1) [업황 사이클][구조적 vs 일시적][경쟁 구도][매크로 민감도] 각 항목은 "
+    "'사업보고서 근거 청크'에 실제로 관련된 서술이 있을 때만 그 문장 끝에 "
+    "[C012] 형식으로 인용하며 쓰고, 관련 청크가 없으면 다른 말 없이 '자료상 "
+    "확인 불가'라고만 써라. 제공된 '사용 가능 청크 id' 목록에 없는 id는 "
+    "인용하지 마라.\n"
+    "2) [리포트 동향]은 '한경컨센서스 리비전 통계' 블록에 제시된 숫자만 그대로 "
+    "옮기고 해석하되, 새 숫자를 계산해서 만들지 마라(대괄호 인용 태그도 붙이지 "
+    "마라 — 청크 출처가 아니라 코드 계산값이다).\n"
+    "3) [구조적 vs 일시적]은 업계 전체의 문제(구조적 쇠퇴)인지 이 회사만의 "
+    "문제(개별 이슈)인지를 청크 근거로 구분하고, 구분할 근거가 없으면 "
+    "'판별 불가'라고 써라. 근거 없이 단정하지 마라.\n"
+    "4) [촉매]는 위 항목들 중 '저평가 상태를 끝낼 계기'로 볼 만한 것이 실제로 "
+    "있으면 그것을 지목하고(청크 근거면 인용 포함), 없으면 '뚜렷한 촉매 확인 "
+    "불가'라고 써라.\n"
+    "5) [결론]은 위 내용을 종합해 '일시적 저평가로 추정' / '구조적 저평가(가치"
+    "함정 우려)' / '판단 보류(근거 부족)' 중 하나를 고르고 이유를 한 문장으로 "
+    "덧붙여라. 근거가 대부분 '자료상 확인 불가'면 반드시 '판단 보류'를 골라라.\n"
+    "6) 자본시장연구원/산업연구원/KDI/관세청/한국은행 등 거시·정책 자료는 "
+    "이번 점검에 제공되지 않았으니 언급하거나 지어내지 말고, 관련 항목은 "
+    "'자료상 확인 불가'로만 남겨라.\n"
+    "7) 출력 형식: [업황 사이클] [구조적 vs 일시적] [경쟁 구도] [매크로 민감도] "
+    "[리포트 동향] [촉매] [결론]"
+)
+
+
+def check_value_investment(state: AnalysisState) -> AnalysisState:
+    """5단계: quality_signal(invest_point.build_value_signal — analysis_history.
+    value_signal 컬럼과 동일 정의)이 True인 종목만 가치주 점검을 수행해
+    invest_mng.value_invest에 저장한다. 나머지 종목은 LLM 호출/DB 쓰기 모두
+    생략한다(비용·노이즈를 quality_signal 통과 종목으로 한정 — 사용자 요청)."""
+    valuation = (state.get("invest_point") or {}).get("valuation") or {}
+    if not valuation.get("quality_signal"):
+        return {}
+
+    stock_code, corp_name = state.get("stock_code"), state.get("corp_name")
+
+    try:
+        import hankyung_consensus
+        revisions = hankyung_consensus.fetch_estimate_revisions(stock_code, corp_name or "")
+    except Exception as e:  # noqa: BLE001  (보조 정보 — 실패해도 점검 자체는 계속)
+        log.warning("한경컨센서스 조회 실패(%s): %s", stock_code, e)
+        revisions = {}
+    revision_block = value_investment_check.format_revision_block(revisions)
+
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from llm_backend import get_chat_model
+        llm = get_chat_model(temperature=0.2, max_tokens=2000)
+    except Exception as e:  # noqa: BLE001
+        return {"errors": _append_error(state, "check_value_investment(init)", e)}
+
+    b = _build_prompt_blocks(state)
+    human = (
+        f"종목: {corp_name} ({stock_code})\n\n"
+        f"[정량 투자포인트]\n{b['ip_block']}\n\n"
+        f"[한경컨센서스 리비전 통계]\n{revision_block}\n\n"
+        f"[사용 가능 청크 id — 이 중에서만 인용]\n{b['valid_ids']}\n\n"
+        f"[사업보고서 근거 청크]\n{state.get('rag_context', '(없음)')}"
+    )
+
+    try:
+        resp = llm.invoke([SystemMessage(content=_VALUE_CHECK_SYSTEM), HumanMessage(content=human)])
+        text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    except Exception as e:  # noqa: BLE001  (네트워크/키 등 광범위)
+        return {"errors": _append_error(state, "check_value_investment(llm)", e)}
+
+    if not text.strip():
+        return {"errors": _append_error(
+            state, "check_value_investment(llm)",
+            RuntimeError("가치주 점검 LLM 응답이 비어 있음"))}
+
+    try:
+        invest_mng_store.save_value_invest(stock_code, text)
+    except Exception as e:  # noqa: BLE001
+        return {"value_investment": text,
+                "errors": _append_error(state, "check_value_investment(save)", e)}
+
+    return {"value_investment": text}
 
 
 _SECTION_TAG_ALT = "|".join(re.escape(t) for t in SECTION_TAGS)
@@ -899,6 +1003,12 @@ def build_graph():
     # 동일하게 경로별 전용 노드 인스턴스로 분리해 각 경로가 정확히 1회만 저장하게 한다.
     g.add_node("save_history", save_history)
     g.add_node("save_history_2", save_history)
+    # 5단계: quality_signal 종목만 가치주 점검 → invest_mng.value_invest 저장.
+    # save_history 뒤에 순수 선형으로 이어붙인다(새 fan-in 없음 — analyze 근처
+    # 위 주석들의 double-execution 위험과 무관). save_history와 같은 이유로
+    # 두 종료 경로 각각 전용 노드 인스턴스로 분리한다.
+    g.add_node("check_value_investment", check_value_investment)
+    g.add_node("check_value_investment_2", check_value_investment)
 
     g.add_edge(START, "resolve_corp")
     # 사업보고서 체인: 본문(RAG) + 사업의 개요(합성 청크) → rag_retrieve에서 병합 → analyze
@@ -952,10 +1062,12 @@ def build_graph():
     g.add_edge("verify_citations_2", "verify_scenario_2")
     # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 4단계 요약 → 저장 노드를 거쳐 END로
     g.add_edge("build_summary", "save_history")
-    g.add_edge("save_history", END)
+    g.add_edge("save_history", "check_value_investment")
+    g.add_edge("check_value_investment", END)
     g.add_edge("verify_scenario_2", "build_summary_2")
     g.add_edge("build_summary_2", "save_history_2")
-    g.add_edge("save_history_2", END)
+    g.add_edge("save_history_2", "check_value_investment_2")
+    g.add_edge("check_value_investment_2", END)
     return g.compile()
 
 
@@ -1068,6 +1180,11 @@ if __name__ == "__main__":
                   f"리포트 절: {sc['signal_check']['section'][:80]}")
         if sc.get("unverified_numbers"):
             print(f"   - 미검증 파생수치: {sc['unverified_numbers'][:5]}")
+
+    value_investment = result.get("value_investment")
+    if value_investment:
+        print("\n--- 5단계: 가치주 점검(quality_signal 통과 종목만, invest_mng.value_invest에 저장됨) ---")
+        print(value_investment)
 
     if result.get("errors"):
         print("\n--- 수집/분석 경고 ---")

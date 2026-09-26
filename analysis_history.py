@@ -140,7 +140,14 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                            {annual_placeholders})""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
-                 bool(valuation.get("signal")), valuation.get("band_position"),
+                 # value_signal 컬럼: 기존 시그널(밴드 하단+성장 AND) 대신
+                 # invest_point.build_value_signal()의 quality_signal(상장 5년+ &
+                 # 매출 지속 상승 & 최근 3개년 영업이익·순이익 연속 상승 & 목표가
+                 # 상승여력 50%+)을 그대로 쓴다 — 사용자 요청(analysis_history.
+                 # value_signal 조건 대체). signal 필드 자체는 건드리지 않아
+                 # 리포트 프롬프트/scenario_check 쪽 영향은 없다.
+                 bool(valuation.get("quality_signal")),
+                 valuation.get("band_position"),
                  valuation.get("target_upside_pct"), (price or {}).get("price"),
                  (citation_report or {}).get("verdict"),
                  (citation_report or {}).get("avg_grounding"),
