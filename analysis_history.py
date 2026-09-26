@@ -90,6 +90,58 @@ def _annual_offset_values(annual_highlight: Optional[list]) -> dict:
     return out
 
 
+# _SCHEMA/_ensure_schema: analysis_history 테이블 생성 + 이후 추가된 컬럼들을
+# idempotent하게(ADD COLUMN IF NOT EXISTS) 맞춘다. 한때 이 블록 전체가 커밋
+# 17a2a20("run() 시작 시 fail-fast: ollama_healthy()...")에서 그 목적과 무관하게
+# 실수로 삭제된 적이 있다(git show 17a2a20 -- analysis_history.py로 확인) — 그
+# 사이 실제 DB는 이미 마이그레이션된 상태라 드러나지 않았을 뿐, save_run()/
+# get_recent()가 스키마를 전혀 보장하지 않고 있었다. value_invest 컬럼을 추가
+# 하면서 복구한다.
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS analysis_history (
+    id SERIAL PRIMARY KEY,
+    stock_code TEXT NOT NULL,
+    corp_name TEXT,
+    run_at TIMESTAMP NOT NULL,
+    report_nm TEXT,
+    rcept_dt TEXT,
+    growth_trend TEXT,
+    op_yoy_forward DOUBLE PRECISION,
+    value_signal BOOLEAN,
+    band_position DOUBLE PRECISION,
+    target_upside_pct DOUBLE PRECISION,
+    price DOUBLE PRECISION,
+    citation_verdict TEXT,
+    avg_grounding DOUBLE PRECISION,
+    cross_check_ok BOOLEAN,
+    scenario_verdict TEXT,
+    regenerated BOOLEAN,
+    report TEXT,
+    investment_summary TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hist_stock_time ON analysis_history(stock_code, run_at DESC);
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS investment_summary TEXT;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS avg_grounding DOUBLE PRECISION;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS earnings_stability_score INTEGER;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS financial_stability_score INTEGER;
+-- 성장점수/가치점수 기능 자체를 제거하기로 해서(사용자 확정) 컬럼도 드롭한다.
+ALTER TABLE analysis_history DROP COLUMN IF EXISTS growth_score;
+ALTER TABLE analysis_history DROP COLUMN IF EXISTS value_score;
+-- 5단계: quality_signal 통과 종목의 가치주 점검 결과(원래 invest_mng.value_invest에
+-- 저장했다가 사용자 요청으로 여기로 이전).
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS value_invest TEXT;
+""" + "\n".join(
+    f'ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS "{col}" DOUBLE PRECISION;'
+    for col in _ANNUAL_COLUMNS
+) + "\n"
+
+
+def _ensure_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(_SCHEMA)
+    conn.commit()
+
+
 def is_enabled() -> bool:
     return os.getenv("DISABLE_HISTORY", "0") != "1"
 
@@ -113,7 +165,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             report: Optional[str] = None,
             investment_summary: Optional[str] = None,
             stability: Optional[dict] = None,
-            annual_highlight: Optional[list] = None) -> None:
+            annual_highlight: Optional[list] = None,
+            value_invest: Optional[str] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
@@ -127,16 +180,17 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
     annual_placeholders = ", ".join(["%s"] * len(_ANNUAL_COLUMNS))
     conn = _connect()
     try:
+        _ensure_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
                 f"""INSERT INTO analysis_history
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
                     citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
-                    regenerated, report, investment_summary,
+                    regenerated, report, investment_summary, value_invest,
                     earnings_stability_score, financial_stability_score,
                     {annual_col_sql})
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                            {annual_placeholders})""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
@@ -153,7 +207,7 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  (citation_report or {}).get("avg_grounding"),
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
-                 bool(regenerated), report, investment_summary,
+                 bool(regenerated), report, investment_summary, value_invest,
                  earnings_stability.get("score"), financial_stability.get("score"),
                  *[annual_vals.get(c) for c in _ANNUAL_COLUMNS]),
             )
@@ -168,6 +222,7 @@ def get_recent(stock_code: str, *, limit: int = 5) -> list[dict]:
         return []
     conn = _connect()
     try:
+        _ensure_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT * FROM analysis_history WHERE stock_code=%s "

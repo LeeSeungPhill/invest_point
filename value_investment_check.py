@@ -4,7 +4,7 @@ value_investment_check.py
 4단계 이후 보조 체크: invest_point.build_value_signal()의 quality_signal이
 True인 종목만, 사용자가 제공한 가치주 점검 체크리스트("이 종목이 싼 이유가
 일시적인가 구조적인가", "싼 상태를 끝낼 촉매가 있는가")를 정리해
-invest_mng.value_invest에 저장할 텍스트를 만든다(실제 LLM 호출/프롬프트
+analysis_history.value_invest에 저장할 텍스트를 만든다(실제 LLM 호출/프롬프트
 조립은 mvp_graph.check_value_investment가 담당 — 여기는 그 전 단계인
 '코드로 계산 가능한 정량 통계'만 순수 함수로 만든다. invest_point.py/
 stability_score.py와 같은 이유 — LLM은 숫자를 새로 만들지 않고 여기서

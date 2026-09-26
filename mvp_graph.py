@@ -23,7 +23,7 @@ mvp_graph.py
        상승 & 최근 실적 상승 & 목표가 상승여력 50%+)이 True인 종목만, 가치주
        점검 체크리스트(업황 사이클/구조적 쇠퇴 신호/경쟁 구도/매크로 민감도 +
        한경컨센서스 추정치 리비전·커버리지·편차)를 LLM으로 정리해
-       invest_mng.value_invest에 저장한다(check_value_investment). 리비전
+       analysis_history.value_invest에 저장한다(check_value_investment). 리비전
        통계는 value_investment_check.py가 코드로 계산하고, 산업/경쟁 관련
        정성 판단은 이미 수집된 사업보고서 RAG 청크에 실제 근거가 있을 때만
        [Cxxx] 인용과 함께 서술하게 한다(analyze()와 같은 인용 규율). 자본시장
@@ -77,7 +77,6 @@ from industry_category import classify_industry
 import stability_score
 import analysis_history
 import telegram_alert
-import invest_mng_store
 import value_investment_check
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
@@ -386,7 +385,11 @@ def load_history(state: AnalysisState) -> AnalysisState:
 
 def save_history(state: AnalysisState) -> AnalysisState:
     """3단계: 이번 실행의 핵심 결과를 다음 분석이 참조할 수 있도록 저장.
-    두 종료 경로(재생성 없음 / 1회 재생성 후) 모두 이 노드를 거쳐 END로 간다."""
+    두 종료 경로(재생성 없음 / 1회 재생성 후) 모두 이 노드를 거쳐 END로 간다.
+    check_value_investment가 이 노드보다 먼저 실행되도록 그래프에 연결돼 있어
+    (build_summary -> check_value_investment -> save_history) state['value_investment']가
+    이미 채워져 있으면 같은 행에 함께 저장한다(사용자 요청 — 별도 UPDATE 없이
+    INSERT 한 번으로)."""
     try:
         analysis_history.save_run(
             stock_code=state.get("stock_code"), corp_name=state.get("corp_name"),
@@ -398,6 +401,7 @@ def save_history(state: AnalysisState) -> AnalysisState:
             investment_summary=state.get("investment_summary"),
             stability=state.get("stability"),
             annual_highlight=(state.get("fnguide") or {}).get("annual_highlight"),
+            value_invest=state.get("value_investment"),
         )
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
@@ -437,8 +441,10 @@ _VALUE_CHECK_SYSTEM = (
 def check_value_investment(state: AnalysisState) -> AnalysisState:
     """5단계: quality_signal(invest_point.build_value_signal — analysis_history.
     value_signal 컬럼과 동일 정의)이 True인 종목만 가치주 점검을 수행해
-    invest_mng.value_invest에 저장한다. 나머지 종목은 LLM 호출/DB 쓰기 모두
-    생략한다(비용·노이즈를 quality_signal 통과 종목으로 한정 — 사용자 요청)."""
+    state['value_investment']에 채운다(실제 DB 저장은 save_history가 analysis_
+    history.value_invest 컬럼에 함께 INSERT — 그래프에서 이 노드가 save_history
+    보다 먼저 실행되도록 연결돼 있다). 나머지 종목은 LLM 호출 자체를 생략한다
+    (비용·노이즈를 quality_signal 통과 종목으로 한정 — 사용자 요청)."""
     valuation = (state.get("invest_point") or {}).get("valuation") or {}
     if not valuation.get("quality_signal"):
         return {}
@@ -479,12 +485,6 @@ def check_value_investment(state: AnalysisState) -> AnalysisState:
         return {"errors": _append_error(
             state, "check_value_investment(llm)",
             RuntimeError("가치주 점검 LLM 응답이 비어 있음"))}
-
-    try:
-        invest_mng_store.save_value_invest(stock_code, text)
-    except Exception as e:  # noqa: BLE001
-        return {"value_investment": text,
-                "errors": _append_error(state, "check_value_investment(save)", e)}
 
     return {"value_investment": text}
 
@@ -1003,10 +1003,11 @@ def build_graph():
     # 동일하게 경로별 전용 노드 인스턴스로 분리해 각 경로가 정확히 1회만 저장하게 한다.
     g.add_node("save_history", save_history)
     g.add_node("save_history_2", save_history)
-    # 5단계: quality_signal 종목만 가치주 점검 → invest_mng.value_invest 저장.
-    # save_history 뒤에 순수 선형으로 이어붙인다(새 fan-in 없음 — analyze 근처
-    # 위 주석들의 double-execution 위험과 무관). save_history와 같은 이유로
-    # 두 종료 경로 각각 전용 노드 인스턴스로 분리한다.
+    # 5단계: quality_signal 종목만 가치주 점검 → save_history가 analysis_history.
+    # value_invest 컬럼에 같은 행으로 저장할 수 있도록 save_history보다 먼저
+    # 순수 선형으로 이어붙인다(새 fan-in 없음 — analyze 근처 위 주석들의
+    # double-execution 위험과 무관). save_history와 같은 이유로 두 종료 경로
+    # 각각 전용 노드 인스턴스로 분리한다.
     g.add_node("check_value_investment", check_value_investment)
     g.add_node("check_value_investment_2", check_value_investment)
 
@@ -1061,13 +1062,13 @@ def build_graph():
     g.add_edge("regenerate_analysis", "verify_citations_2")
     g.add_edge("verify_citations_2", "verify_scenario_2")
     # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 4단계 요약 → 저장 노드를 거쳐 END로
-    g.add_edge("build_summary", "save_history")
-    g.add_edge("save_history", "check_value_investment")
-    g.add_edge("check_value_investment", END)
+    g.add_edge("build_summary", "check_value_investment")
+    g.add_edge("check_value_investment", "save_history")
+    g.add_edge("save_history", END)
     g.add_edge("verify_scenario_2", "build_summary_2")
-    g.add_edge("build_summary_2", "save_history_2")
-    g.add_edge("save_history_2", "check_value_investment_2")
-    g.add_edge("check_value_investment_2", END)
+    g.add_edge("build_summary_2", "check_value_investment_2")
+    g.add_edge("check_value_investment_2", "save_history_2")
+    g.add_edge("save_history_2", END)
     return g.compile()
 
 
@@ -1183,7 +1184,7 @@ if __name__ == "__main__":
 
     value_investment = result.get("value_investment")
     if value_investment:
-        print("\n--- 5단계: 가치주 점검(quality_signal 통과 종목만, invest_mng.value_invest에 저장됨) ---")
+        print("\n--- 5단계: 가치주 점검(quality_signal 통과 종목만, analysis_history.value_invest에 저장됨) ---")
         print(value_investment)
 
     if result.get("errors"):
