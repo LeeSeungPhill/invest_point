@@ -71,6 +71,7 @@ from dart_client import DartClient, DartError, REPRT_CODE
 from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
 from invest_point import build_growth_signal
+from invest_point import explain_quality_signal
 from cross_check import run_cross_check, format_cross_check_block
 from scenario_check import SECTION_TAGS
 from industry_category import classify_industry
@@ -253,7 +254,9 @@ def fetch_fnguide(state: AnalysisState) -> AnalysisState:
 
 def fetch_price(state: AnalysisState) -> AnalysisState:
     """현재가·52주 밴드·PER/PBR·컨센서스 목표주가(가치 관점 판단용) + 상장 후
-    경과년수(연간 가치 시그널의 '상장 5년 이상' 보조 조건에 사용)."""
+    경과년수(연간 가치 시그널의 '상장 5년 이상' 보조 조건에 사용) + invest_mng.
+    high_price(사용자 지정 목표가, 있으면 quality_signal의 목표주가 상승여력
+    조건에서 컨센서스 목표주가보다 우선 — 사용자 요청)."""
     if not state.get("stock_code"):
         return {"sources_status": {"price": "skip"}}
     try:
@@ -263,6 +266,15 @@ def fetch_price(state: AnalysisState) -> AnalysisState:
             price.update(fetch_listing_age(state["stock_code"]))
         except Exception as e:  # noqa: BLE001  (보조 정보라 실패해도 price 자체는 유효)
             log.warning("상장일 조회 실패(%s): %s", state["stock_code"], e)
+        try:
+            import invest_mng_lookup
+            high_price = invest_mng_lookup.fetch_high_price(state["stock_code"])
+            if high_price is not None and price.get("price"):
+                price["mng_high_price"] = high_price
+                price["mng_target_upside_pct"] = round(
+                    (high_price / price["price"] - 1) * 100, 1)
+        except Exception as e:  # noqa: BLE001  (보조 정보라 실패해도 price 자체는 유효)
+            log.warning("invest_mng.high_price 조회 실패(%s): %s", state["stock_code"], e)
         return {"price": price, "sources_status": {"price": "ok"}}
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "fetch_price", e),
@@ -352,8 +364,16 @@ def fetch_biz_summary(state: AnalysisState) -> AnalysisState:
 
 def build_invest_point(state: AnalysisState) -> AnalysisState:
     """2단계: 성장(예상실적 방향) + 가치(컨센서스 목표주가 상승여력) 정량 시그널
-    계산. fetch_fnguide/fetch_price 결과만으로 순수 계산(숫자 생성 없음)."""
+    계산. fetch_fnguide/fetch_price 결과만으로 순수 계산(숫자 생성 없음).
+    quality_signal(analysis_history.value_signal 컬럼)이 False면 그 사유를
+    로그로 남긴다(사용자 요청 — 어느 조건에서 걸렸는지 나중에 로그만 보고
+    바로 알 수 있도록)."""
     ip = build_invest_point_calc(state.get("fnguide"), state.get("price"))
+    valuation = ip.get("valuation") or {}
+    if not valuation.get("quality_signal"):
+        log.info("quality_signal=False(%s/%s): %s",
+                 state.get("stock_code"), state.get("corp_name"),
+                 explain_quality_signal(valuation) or "사유 없음(정상 False)")
     return {"invest_point": ip}
 
 

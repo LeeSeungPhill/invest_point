@@ -120,6 +120,12 @@ DEEP_UPSIDE_THRESHOLD_PCT = 50  # analysis_history.value_signal 보조조건: �
 # FUTURE_YEARS개년(사용자 요청, 기존 '실측 3개년'에서 변경).
 RECENT_EARNINGS_PAST_YEARS = 2
 RECENT_EARNINGS_FUTURE_YEARS = 1
+# analysis_history.value_signal 보조조건: 매출액 상승 관찰 기간 — 현재년도 기준
+# 과거 실측 REVENUE_PAST_YEARS개년 + 예상실적 REVENUE_FUTURE_YEARS개년(사용자
+# 요청, 기존 '실측 5개년'에서 변경 — 실측 개수만 4로 줄고 예상 1개년이 더해져
+# 총 관찰 기간 자체는 5개년으로 동일).
+REVENUE_PAST_YEARS = 4
+REVENUE_FUTURE_YEARS = 1
 
 
 def _annual_actual_series(annual_highlight: Optional[list]) -> list:
@@ -136,21 +142,26 @@ def _annual_estimate_series(annual_highlight: Optional[list]) -> list:
     return [r for r in annual_highlight if r.get("is_estimate")]
 
 
-def _revenue_consistently_rising(actual: list) -> Optional[bool]:
-    """실측 연도 매출액이 예외 없이 연속 증가했는지. 비교할 연도가 2개 미만이거나
-    값이 비어 있으면 '지속적' 여부를 판단할 근거가 없어 None(불명)을 반환한다."""
-    revs = [r.get("revenue") for r in actual]
-    if len(revs) < 2 or any(v is None for v in revs):
-        return None
-    return all(revs[i] > revs[i - 1] for i in range(1, len(revs)))
-
-
 def _rising_or_none(vals: list) -> Optional[bool]:
     """모든 값이 있어야 판단 가능. 하나라도 비면 None(불명), 값이 다 있으면
     연속 증가 여부(bool)를 반환한다."""
     if any(v is None for v in vals):
         return None
     return all(vals[i] > vals[i - 1] for i in range(1, len(vals)))
+
+
+def _revenue_consistently_rising(actual: list, estimate: list) -> Optional[bool]:
+    """매출액 상승 관찰: 현재년도 기준 과거 REVENUE_PAST_YEARS개년(실측) +
+    예상실적 REVENUE_FUTURE_YEARS개년(추정 중 가장 가까운 해)을 합한 기간
+    동안 매출액이 예외 없이 연속 증가했는지(사용자 요청 — 기존 '실측
+    5개년'에서 '실측 과거 4개년+예상 1개년'으로 변경). 필요한 연도 수(실측
+    4개년/예상 1개년)를 못 채우거나 값이 비어 있으면 None(불명)을 반환한다."""
+    recent_actual = actual[-REVENUE_PAST_YEARS:]
+    recent_est = estimate[:REVENUE_FUTURE_YEARS]
+    if len(recent_actual) < REVENUE_PAST_YEARS or len(recent_est) < REVENUE_FUTURE_YEARS:
+        return None
+    recent = recent_actual + recent_est
+    return _rising_or_none([r.get("revenue") for r in recent])
 
 
 def _recent_earnings_rising(actual: list, estimate: list) -> Optional[bool]:
@@ -180,11 +191,17 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
     """가치 관점: 예상실적 상승 + 주가가 52주 밴드 하단인지(signal — LLM 리포트
     [가치 포지션]/scenario_check.py가 그대로 참조하는 기존 정의, 변경하지 않음).
 
-    quality_signal은 여기에 얹는 별개 시그널이다: 상장 5년 이상 + 실측 매출액
-    지속 상승 + 최근 실적 개선(현재년도 기준 과거 RECENT_EARNINGS_PAST_YEARS
-    개년 실측 + 예상 RECENT_EARNINGS_FUTURE_YEARS개년을 합해 영업이익 또는
-    당기순이익 중 하나라도 연속 상승) + 목표주가 상승여력 50% 이상을 모두
-    만족하면 True. signal과 달리 LLM 프롬프트/scenario_check는 이 필드를
+    quality_signal은 여기에 얹는 별개 시그널이다: 상장 5년 이상 + 매출액 상승
+    (현재년도 기준 과거 REVENUE_PAST_YEARS개년 실측 + 예상 REVENUE_FUTURE_YEARS
+    개년을 합해 연속 상승) + 최근 실적 개선(현재년도 기준 과거 RECENT_EARNINGS_
+    PAST_YEARS개년 실측 + 예상 RECENT_EARNINGS_FUTURE_YEARS개년을 합해 영업이익
+    또는 당기순이익 중 하나라도 연속 상승) + 목표주가 상승여력 50% 이상을 모두
+    만족하면 True. 목표주가 상승여력은 invest_mng.high_price(사용자 지정
+    목표가, price['mng_target_upside_pct']로 전달됨)가 있으면 그것을 컨센서스
+    목표주가(target_upside_pct)보다 우선 쓴다(사용자 요청) — target_upside_pct
+    필드 자체는 리포트/DB의 다른 곳(투자포인트 표시, 컨센서스 대비 등)에서
+    그대로 쓰이므로 컨센서스 값 그대로 유지하고, quality_signal 판단에서만
+    갈아 끼운다. signal과 달리 LLM 프롬프트/scenario_check는 이 필드를
     보지 않는다 —
     analysis_history.save_run()이 DB의 value_signal 컬럼 값을 만들 때 signal
     대신 이 값을 그대로 쓴다(사용자 요청: 기존 조건을 '상장 5년+, 매출 지속
@@ -206,13 +223,21 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
     signal = bool(est_rising and is_low_band)
 
     target_upside_pct = price.get("target_upside_pct") if price else None
+    mng_target_upside_pct = price.get("mng_target_upside_pct") if price else None
+    # quality_signal 판단용 상승여력: invest_mng.high_price가 있으면 그것을
+    # 우선하고(사용자 요청), 없으면 기존 컨센서스 목표주가로 대체한다.
+    deep_upside_pct_used = (mng_target_upside_pct if mng_target_upside_pct is not None
+                            else target_upside_pct)
+    deep_upside_source = ("invest_mng" if mng_target_upside_pct is not None
+                          else "consensus" if target_upside_pct is not None else None)
     years_listed = price.get("years_listed") if price else None
     actual = _annual_actual_series(annual_highlight)
     estimate = _annual_estimate_series(annual_highlight)
     listed_5y = years_listed is not None and years_listed >= LISTED_YEARS_THRESHOLD
-    revenue_up = _revenue_consistently_rising(actual)
+    revenue_up = _revenue_consistently_rising(actual, estimate)
     earnings_rising = _recent_earnings_rising(actual, estimate)
-    deep_upside = target_upside_pct is not None and target_upside_pct >= DEEP_UPSIDE_THRESHOLD_PCT
+    deep_upside = (deep_upside_pct_used is not None
+                  and deep_upside_pct_used >= DEEP_UPSIDE_THRESHOLD_PCT)
     quality_signal = bool(listed_5y and revenue_up and earnings_rising and deep_upside)
 
     return {
@@ -228,10 +253,49 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
         "listed_5y": listed_5y,
         "revenue_consistently_rising": revenue_up,
         "recent_earnings_rising": earnings_rising,
+        "deep_upside_pct_used": deep_upside_pct_used,
+        "deep_upside_source": deep_upside_source,
         "deep_upside_50pct": deep_upside,
         "quality_signal": quality_signal,
         "notes": notes,
     }
+
+
+def explain_quality_signal(valuation: dict) -> str:
+    """quality_signal이 False인 이유를 사람이 읽을 수 있는 문장으로 설명한다
+    (호출부인 mvp_graph.build_invest_point가 로그로 남긴다 — 사용자 요청).
+    quality_signal이 True면 빈 문자열을 반환한다. 조건별로 '판단 결과 False'와
+    '판단 자체가 불가(자료 부족)'를 구분해서 알려준다 — 둘은 원인이 달라서
+    (전자는 실적/매출 방향이 실제로 안 좋은 것, 후자는 데이터가 없어서 아예
+    확인이 안 된 것) 뭉뚱그리면 어디를 봐야 할지 알 수 없다."""
+    if valuation.get("quality_signal"):
+        return ""
+
+    reasons = []
+    years_listed = valuation.get("years_listed")
+    if not valuation.get("listed_5y"):
+        reasons.append(f"상장경과 {years_listed}년 < {LISTED_YEARS_THRESHOLD}년" if years_listed is not None
+                       else "상장일 확인 불가")
+
+    revenue_up = valuation.get("revenue_consistently_rising")
+    if revenue_up is not True:
+        reasons.append(f"매출액 상승(과거{REVENUE_PAST_YEARS}+예상{REVENUE_FUTURE_YEARS}개년) 미충족"
+                       if revenue_up is False else "매출액 상승 여부 판단 불가(자료 부족)")
+
+    earnings_up = valuation.get("recent_earnings_rising")
+    if earnings_up is not True:
+        reasons.append(f"최근실적(영업이익/순이익) 상승(과거{RECENT_EARNINGS_PAST_YEARS}+"
+                       f"예상{RECENT_EARNINGS_FUTURE_YEARS}개년) 미충족" if earnings_up is False
+                       else "최근실적 상승 여부 판단 불가(자료 부족)")
+
+    upside_pct = valuation.get("deep_upside_pct_used")
+    upside_source = valuation.get("deep_upside_source")
+    if not valuation.get("deep_upside_50pct"):
+        reasons.append(
+            f"목표가 상승여력 {upside_pct}%({upside_source}) < {DEEP_UPSIDE_THRESHOLD_PCT}%"
+            if upside_pct is not None else "목표가 상승여력 확인 불가")
+
+    return "; ".join(reasons)
 
 
 def build_invest_point(fnguide: Optional[dict], price: Optional[dict]) -> dict:
