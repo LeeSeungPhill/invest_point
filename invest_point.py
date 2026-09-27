@@ -115,7 +115,11 @@ def build_growth_signal(fnguide: dict) -> dict:
 
 LISTED_YEARS_THRESHOLD = 5     # analysis_history.value_signal 보조조건: 상장 후 경과년수
 DEEP_UPSIDE_THRESHOLD_PCT = 50  # analysis_history.value_signal 보조조건: 목표주가 상승여력
-RECENT_EARNINGS_WINDOW = 3     # analysis_history.value_signal 보조조건: 최근 실적 개선 관찰 연수
+# analysis_history.value_signal 보조조건: 최근 실적 개선 관찰 기간 — 현재년도
+# 기준 과거 실측 RECENT_EARNINGS_PAST_YEARS개년 + 예상실적 RECENT_EARNINGS_
+# FUTURE_YEARS개년(사용자 요청, 기존 '실측 3개년'에서 변경).
+RECENT_EARNINGS_PAST_YEARS = 2
+RECENT_EARNINGS_FUTURE_YEARS = 1
 
 
 def _annual_actual_series(annual_highlight: Optional[list]) -> list:
@@ -123,6 +127,13 @@ def _annual_actual_series(annual_highlight: Optional[list]) -> list:
     if not annual_highlight:
         return []
     return [r for r in annual_highlight if not r.get("is_estimate")]
+
+
+def _annual_estimate_series(annual_highlight: Optional[list]) -> list:
+    """annual_highlight(실측+추정, 오래된순)에서 추정 연도만, 가까운 미래부터."""
+    if not annual_highlight:
+        return []
+    return [r for r in annual_highlight if r.get("is_estimate")]
 
 
 def _revenue_consistently_rising(actual: list) -> Optional[bool]:
@@ -134,19 +145,35 @@ def _revenue_consistently_rising(actual: list) -> Optional[bool]:
     return all(revs[i] > revs[i - 1] for i in range(1, len(revs)))
 
 
-def _recent_earnings_rising(actual: list, window: int = RECENT_EARNINGS_WINDOW) -> Optional[bool]:
-    """최근 window개년(기본 3, 실측이 그보다 적으면 있는 만큼) 영업이익·당기순이익이
-    둘 다 예외 없이 연속 증가했는지('실적이 좋아지는' 조건). 비교할 연도가 2개
-    미만이거나 값이 비어 있으면 None(불명)을 반환한다. 적자 여부 자체는 안 보고
-    방향(증가 추세)만 본다 — 적자 배제는 이 조건에서 의도적으로 뺐다(사용자 요청)."""
-    recent = actual[-window:] if len(actual) >= window else actual
-    op = [r.get("op_profit") for r in recent]
-    ni = [r.get("net_profit") for r in recent]
-    if len(recent) < 2 or any(v is None for v in op) or any(v is None for v in ni):
+def _rising_or_none(vals: list) -> Optional[bool]:
+    """모든 값이 있어야 판단 가능. 하나라도 비면 None(불명), 값이 다 있으면
+    연속 증가 여부(bool)를 반환한다."""
+    if any(v is None for v in vals):
         return None
-    op_rising = all(op[i] > op[i - 1] for i in range(1, len(op)))
-    ni_rising = all(ni[i] > ni[i - 1] for i in range(1, len(ni)))
-    return op_rising and ni_rising
+    return all(vals[i] > vals[i - 1] for i in range(1, len(vals)))
+
+
+def _recent_earnings_rising(actual: list, estimate: list) -> Optional[bool]:
+    """최근 실적 개선 관찰: 현재년도 기준 과거 RECENT_EARNINGS_PAST_YEARS개년
+    (실측) + 예상실적 RECENT_EARNINGS_FUTURE_YEARS개년(추정 중 가장 가까운
+    해)을 합한 기간 동안 영업이익 '또는' 당기순이익 중 하나라도 예외 없이
+    연속 증가하면 True('실적이 좋아지는' 조건 — 사용자 요청으로 실측 3개년
+    전부+AND에서, 실측 과거 2개년+예상 1개년+OR로 변경). 한쪽 지표만 값이
+    있어도(다른 쪽이 결측이어도) 있는 지표만으로 판단한다 — 둘 다 결측이거나
+    필요한 연도 수(실측 2개년/예상 1개년)를 못 채우면 None(불명)을 반환한다.
+    적자 여부 자체는 안 보고 방향(증가 추세)만 본다 — 적자 배제는 이 조건에서
+    의도적으로 뺐다(사용자 요청)."""
+    recent_actual = actual[-RECENT_EARNINGS_PAST_YEARS:]
+    recent_est = estimate[:RECENT_EARNINGS_FUTURE_YEARS]
+    if (len(recent_actual) < RECENT_EARNINGS_PAST_YEARS
+            or len(recent_est) < RECENT_EARNINGS_FUTURE_YEARS):
+        return None
+    recent = recent_actual + recent_est
+    op_rising = _rising_or_none([r.get("op_profit") for r in recent])
+    ni_rising = _rising_or_none([r.get("net_profit") for r in recent])
+    if op_rising is None and ni_rising is None:
+        return None
+    return bool(op_rising) or bool(ni_rising)
 
 
 def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[list] = None) -> dict:
@@ -154,9 +181,11 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
     [가치 포지션]/scenario_check.py가 그대로 참조하는 기존 정의, 변경하지 않음).
 
     quality_signal은 여기에 얹는 별개 시그널이다: 상장 5년 이상 + 실측 매출액
-    지속 상승 + 최근 RECENT_EARNINGS_WINDOW개년 영업이익·당기순이익 둘 다 연속
-    상승 + 목표주가 상승여력 50% 이상을 모두 만족하면 True. signal과 달리 LLM
-    프롬프트/scenario_check는 이 필드를 보지 않는다 —
+    지속 상승 + 최근 실적 개선(현재년도 기준 과거 RECENT_EARNINGS_PAST_YEARS
+    개년 실측 + 예상 RECENT_EARNINGS_FUTURE_YEARS개년을 합해 영업이익 또는
+    당기순이익 중 하나라도 연속 상승) + 목표주가 상승여력 50% 이상을 모두
+    만족하면 True. signal과 달리 LLM 프롬프트/scenario_check는 이 필드를
+    보지 않는다 —
     analysis_history.save_run()이 DB의 value_signal 컬럼 값을 만들 때 signal
     대신 이 값을 그대로 쓴다(사용자 요청: 기존 조건을 '상장 5년+, 매출 지속
     상승, 최근 실적(영업이익·순이익) 상승, 목표가 대비 50%+ 구간'으로 대체).
@@ -179,9 +208,10 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
     target_upside_pct = price.get("target_upside_pct") if price else None
     years_listed = price.get("years_listed") if price else None
     actual = _annual_actual_series(annual_highlight)
+    estimate = _annual_estimate_series(annual_highlight)
     listed_5y = years_listed is not None and years_listed >= LISTED_YEARS_THRESHOLD
     revenue_up = _revenue_consistently_rising(actual)
-    earnings_rising = _recent_earnings_rising(actual)
+    earnings_rising = _recent_earnings_rising(actual, estimate)
     deep_upside = target_upside_pct is not None and target_upside_pct >= DEEP_UPSIDE_THRESHOLD_PCT
     quality_signal = bool(listed_5y and revenue_up and earnings_rising and deep_upside)
 
