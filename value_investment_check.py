@@ -21,10 +21,13 @@ macro·정책 자료는 구조화 API가 없어 자동화하지 않는다. 대�
 """
 from __future__ import annotations
 
+import logging
 import re
 import statistics
 from datetime import date, datetime, timedelta
 from typing import Optional
+
+logger = logging.getLogger("value_investment_check")
 
 
 def _parse_date(s: Optional[str]):
@@ -141,15 +144,26 @@ def _is_low_info(content: str) -> bool:
 
 def filter_low_info_sections(text: str) -> str:
     """[태그] 내용 중 정보 없는 항목(_is_low_info)은 통째로 빼고, 정보가 있는
-    항목만 원래 순서대로 다시 이어붙인다. 태그를 하나도 못 찾으면(형식이
-    깨진 응답) 원문을 그대로 반환한다 — 잘못 파싱해 멀쩡한 내용을 지우는
-    것보다는 원문 보존이 안전하다. 전부 정보 없음으로 걸러지면 그 사실 자체를
-    한 줄로 남긴다(빈 문자열이나 원문 재사용은 둘 다 부정확한 신호를 준다)."""
+    항목만 원래 순서대로 다시 이어붙인다. 전부 정보 없음으로 걸러지면 그 사실
+    자체를 한 줄로 남긴다(빈 문자열보다 명확한 신호).
+
+    태그를 하나도 못 찾으면(형식이 깨진 응답 — 실측 확인: LLM이 이번엔 '[업황
+    사이클]' 같은 대괄호 태그를 아예 안 붙이고 "자료상 확인 불가 판별 불가
+    ... [C015][C017] 상향 1건..."처럼 내용만 나열한 사례가 있었다) 예전에는
+    원문을 그대로 반환했는데, 그러면 이 필터의 존재 의미가 없어진다(필터를
+    거치나 마나 자리표시자 문구가 그대로 저장됨). 태그 파싱이 안 되면 항목별
+    필터링 자체가 불가능하므로, 원문을 흘리는 대신 형식 오류를 명확히 표시하고
+    로그로 남긴다 — 이 경우가 잦으면 mvp_graph._VALUE_CHECK_SYSTEM의 태그
+    준수 지시를 더 강하게 고쳐야 한다는 신호다."""
     if not text:
         return text
     matches = list(_SECTION_RE.finditer(text))
     if not matches:
-        return text
+        logger.warning(
+            "가치주 점검 응답에서 [태그] 형식을 찾지 못해 항목별 필터를 적용할 "
+            "수 없음(LLM이 대괄호 태그를 지키지 않은 것으로 보임) — 원문 대신 "
+            "형식 오류 표시를 저장함. 원문 미리보기: %s", text[:200])
+        return "(가치주 점검: 응답 형식 오류로 파싱 실패)"
     kept = [f"[{m.group(1)}] {m.group(2).strip()}"
             for m in matches if not _is_low_info(m.group(2))]
     return " ".join(kept) if kept else "(가치주 점검: 확인 가능한 근거 없음)"
