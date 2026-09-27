@@ -486,6 +486,10 @@ def check_value_investment(state: AnalysisState) -> AnalysisState:
             state, "check_value_investment(llm)",
             RuntimeError("가치주 점검 LLM 응답이 비어 있음"))}
 
+    # 정보 없는 항목(자료상 확인 불가류 자리표시자, 청크코드+숫자만 남고 실제
+    # 서술이 없는 항목)은 저장 전에 걸러낸다 — 사용자 요청.
+    text = value_investment_check.filter_low_info_sections(text)
+
     return {"value_investment": text}
 
 

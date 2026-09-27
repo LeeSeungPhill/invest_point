@@ -21,6 +21,7 @@ macro·정책 자료는 구조화 API가 없어 자동화하지 않는다. 대�
 """
 from __future__ import annotations
 
+import re
 import statistics
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -107,3 +108,48 @@ def format_revision_block(revisions: Optional[dict]) -> str:
         lines.append("- 한경컨센서스 EPS 추정치 리비전 이력: 자료상 확인 불가(검색 결과 없음)")
 
     return "\n".join(lines)
+
+
+# --- 정보 없는 항목 필터 ---
+# mvp_graph._VALUE_CHECK_SYSTEM이 근거 없을 때 쓰라고 강제하는 자리표시자
+# 문구들. 이 문구'만' 있는 항목은 읽는 사람에게 아무 정보도 안 주므로 표시
+# 자체를 뺀다(실측 확인: [경쟁 구도]/[촉매]가 문장 없이 인용 코드 하나만
+# 덜렁 남긴 사례도 있어 — 예 '[경쟁 구도] C045' — 코드+숫자만 있는 항목도
+# 같이 거른다).
+VALUE_CHECK_TAGS = ("업황 사이클", "구조적 vs 일시적", "경쟁 구도", "매크로 민감도",
+                    "리포트 동향", "촉매", "결론")
+_LOW_INFO_EXACT = {
+    "자료상 확인 불가", "판별 불가", "뚜렷한 촉매 확인 불가", "판단 보류(근거 부족)",
+}
+_CHUNK_ID_RE = re.compile(r"\[?C\d+\]?")
+_TAG_ALT = "|".join(re.escape(t) for t in VALUE_CHECK_TAGS)
+_SECTION_RE = re.compile(rf"\[({_TAG_ALT})\](.*?)(?=\[(?:{_TAG_ALT})\]|$)", re.DOTALL)
+
+
+def _is_low_info(content: str) -> bool:
+    """항목 내용이 (1) 자리표시자 문구 그대로이거나 (2) 청크 인용 코드·숫자·
+    구두점만 남고 실제 서술어가 하나도 없는지 판별한다."""
+    content = content.strip().rstrip(". ")
+    if not content:
+        return True
+    if content in _LOW_INFO_EXACT:
+        return True
+    remainder = _CHUNK_ID_RE.sub("", content)
+    remainder = re.sub(r"[\d,.\-()%\s/:]", "", remainder)
+    return remainder == ""
+
+
+def filter_low_info_sections(text: str) -> str:
+    """[태그] 내용 중 정보 없는 항목(_is_low_info)은 통째로 빼고, 정보가 있는
+    항목만 원래 순서대로 다시 이어붙인다. 태그를 하나도 못 찾으면(형식이
+    깨진 응답) 원문을 그대로 반환한다 — 잘못 파싱해 멀쩡한 내용을 지우는
+    것보다는 원문 보존이 안전하다. 전부 정보 없음으로 걸러지면 그 사실 자체를
+    한 줄로 남긴다(빈 문자열이나 원문 재사용은 둘 다 부정확한 신호를 준다)."""
+    if not text:
+        return text
+    matches = list(_SECTION_RE.finditer(text))
+    if not matches:
+        return text
+    kept = [f"[{m.group(1)}] {m.group(2).strip()}"
+            for m in matches if not _is_low_info(m.group(2))]
+    return " ".join(kept) if kept else "(가치주 점검: 확인 가능한 근거 없음)"
