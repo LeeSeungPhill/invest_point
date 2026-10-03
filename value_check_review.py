@@ -57,21 +57,58 @@ _NUM_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(조|억|만|천|원|%|배|주)?")
 # ---------------------------------------------------------------------- #
 # LLM 호출 공통
 # ---------------------------------------------------------------------- #
+class _OllamaChat:
+    """Ollama /api/chat를 requests로 직접 호출하는 최소 클라이언트.
+
+    simul_server가 이 모듈을 자기 프로세스에서 import하는데, 그 Python 환경에는
+    langchain_ollama/langchain_core가 없을 수 있다(실측: "No module named
+    'langchain_ollama'"로 검토 작업 실패). 이 기능은 단순 챗 호출뿐이라 langchain
+    없이 requests만으로 호출해 의존성을 없앤다. 설정값(OLLAMA_MODEL/BASE_URL/
+    NUM_CTX)은 llm_backend.get_chat_model과 같은 환경변수를 쓴다."""
+
+    def __init__(self, temperature: float, max_tokens: int, think: bool,
+                 timeout: int = 900):
+        import os
+        self.url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/chat"
+        self.model = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+        self.options = {"temperature": temperature, "num_predict": max_tokens,
+                        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "16384"))}
+        self.think = think
+        self.timeout = timeout
+
+    def chat(self, system: str, human: str) -> str:
+        import requests
+        payload = {"model": self.model, "stream": False, "think": self.think,
+                   "options": self.options,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": human}]}
+        r = requests.post(self.url, json=payload, timeout=self.timeout)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Ollama 호출 실패(HTTP {r.status_code}): {r.text[:300]}")
+        return ((r.json().get("message") or {}).get("content") or "")
+
+
 def _llm_text(llm, system: str, human: str) -> str:
-    from langchain_core.messages import SystemMessage, HumanMessage
-    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
-    text = resp.content if isinstance(resp.content, str) else str(resp.content)
-    # reasoning 분리를 지원하지 않는 백엔드/모델 대비: 본문에 섞인 think 블록 제거.
+    if hasattr(llm, "chat"):              # _OllamaChat(기본)
+        text = llm.chat(system, human)
+    else:                                 # LangChain 챗 모델(ollama 외 백엔드)
+        from langchain_core.messages import SystemMessage, HumanMessage
+        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    # think 분리를 지원하지 않는 Ollama/모델 대비: 본문에 섞인 think 블록 제거.
     # 화면은 일반 텍스트 영역이라 마크다운 굵게(**)는 지운다.
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
     return text.replace("**", "").strip()
 
 
 def _default_llm(kind: str):
+    import os
+    review = kind == "review"
+    if os.getenv("LLM_BACKEND", "ollama").lower() == "ollama":
+        return _OllamaChat(temperature=0.2 if review else 0.0,
+                           max_tokens=3000 if review else 800, think=review)
     from llm_backend import get_chat_model
-    if kind == "review":
-        return get_chat_model(temperature=0.2, max_tokens=3000, reasoning=True)
-    return get_chat_model(temperature=0.0, max_tokens=800, reasoning=False)
+    return get_chat_model(temperature=0.2 if review else 0.0, max_tokens=3000 if review else 800)
 
 
 # ---------------------------------------------------------------------- #
