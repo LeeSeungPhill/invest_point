@@ -97,7 +97,7 @@ class AnalysisState(TypedDict, total=False):
     biz_summary: dict           # DART 정확 섹션 기반 '사업의 개요'(문단+표 요약)
     financials: dict            # {revenue:{...}, operating_profit:{...}, net_income:{...}} (DART, 원단위)
     news: list                  # [{title, link, pub_date, summary}]
-    reports: list               # 애널리스트 리포트 메타데이터
+    reports: list               # 최근 90일 애널리스트 리포트(의견·목표주가·본문 요약·PDF 링크)
     consensus: dict             # self-built 컨센서스(목표주가/의견 집계)
     fnguide: dict                # FnGuide/WiseReport 연간·분기 실적+예상, 제품비중, 컨센서스(억원)
     disclosures: list           # 최근 DART 공시 목록(반복성 공시 제외)
@@ -663,9 +663,8 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
             f"- 참여 증권사: {', '.join(cons.get('brokers', [])) or '미상'}"
         )
     else:
-        cons_block = ("(자체 집계 목표주가 컨센서스 없음 — company_list.naver 목록 페이지에는 "
-                     "목표주가 컬럼이 없어 리포트별 집계 불가. 아래 [주가/밸류에이션]의 "
-                     "컨센서스 목표주가를 참고하라.)")
+        cons_block = ("(자체 집계 목표주가 컨센서스 없음 — 최근 90일 내 목표주가를 제시한 "
+                     "리포트가 없다. 아래 [주가/밸류에이션]의 컨센서스 목표주가를 참고하라.)")
 
     fng_cons = (state.get("fnguide") or {}).get("consensus") or {}
     if fng_cons.get("target_price") or fng_cons.get("opinion_label"):
@@ -679,10 +678,31 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
     else:
         fng_cons_block = "(FnGuide/WiseReport 컨센서스 없음 — 자료상 확인 불가)"
 
+    # 최근 90일 최신 10건(fetch_naver_research). 의견·목표주가(직전 대비 상향/하향)와
+    # 증권사 본문 요약을 함께 준다 — 요약은 프롬프트 길이 때문에 건당 200자로 자른다.
     reports = state.get("reports") or []
-    rep_block = "\n".join(
-        f"- {r.get('date','')} {r.get('broker','')} | {r.get('title','')}"
-        for r in reports[:15]) or "(리포트 목록 없음)"
+
+    def _fmt_report(r: dict) -> str:
+        head = f"- {r.get('date','')} {r.get('broker','')} | {r.get('title','')}"
+        meta = []
+        if r.get("opinion"):
+            meta.append(f"의견 {r['opinion']}")
+        tp, prev = r.get("target_price"), r.get("prev_target_price")
+        if tp:
+            chg = ""
+            if prev and prev != tp:
+                chg = f", 직전 {prev:,}원 대비 {'상향' if tp > prev else '하향'}"
+            elif prev == tp:
+                chg = ", 직전과 동일"
+            meta.append(f"목표주가 {tp:,}원{chg}")
+        if meta:
+            head += f" ({'; '.join(meta)})"
+        summ = (r.get("summary") or "").strip()
+        if summ:
+            head += f"\n    요약: {summ[:200]}{'…' if len(summ) > 200 else ''}"
+        return head
+
+    rep_block = "\n".join(_fmt_report(r) for r in reports[:10]) or "(최근 90일 리포트 없음)"
 
     fng = state.get("fnguide") or {}
 

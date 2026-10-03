@@ -17,13 +17,19 @@ from __future__ import annotations
 import os
 
 
-def get_chat_model(temperature: float = 0.2, max_tokens: int = 2000):
+def get_chat_model(temperature: float = 0.2, max_tokens: int = 2000,
+                   reasoning: "bool | None" = None):
+    """reasoning(ollama 전용): None=모델 기본 동작(기존 호출부 그대로), True=thinking을
+    응답 본문과 분리, False=thinking 끄기(키워드 추출·검증처럼 짧은 호출용 — qwen3가
+    추론에 토큰을 다 써서 답이 비는 것을 방지)."""
     backend = os.getenv("LLM_BACKEND", "ollama").lower()
 
     if backend == "ollama":
         # pip install langchain-ollama ; ollama pull qwen3:8b
         from langchain_ollama import ChatOllama
+        extra = {} if reasoning is None else {"reasoning": reasoning}
         return ChatOllama(
+            **extra,
             model=os.getenv("OLLAMA_MODEL", "qwen3:8b"),
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             temperature=temperature,

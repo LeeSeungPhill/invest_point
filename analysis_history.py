@@ -25,6 +25,7 @@ DISABLE_HISTORY=1 로 저장/조회를 모두 끌 수 있다(DB 접속 불가 �
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Optional
 
@@ -136,10 +137,26 @@ ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS value_invest TEXT;
 ) + "\n"
 
 
+# 스키마 보장은 프로세스당 1회만 한다. ALTER TABLE ... IF NOT EXISTS도 컬럼 존재 여부와
+# 무관하게 테이블 AccessExclusiveLock을 잡기 때문에, 매 조회마다 실행하면 동시 조회끼리
+# 교착(deadlock detected)이 난다 — 실측: simul_server 투자관리 현황 목록(종목별 병렬
+# get_recent)과 종목 조회가 겹칠 때 "투자분석 이력 조회 오류: deadlock detected"로
+# 실패. 잠금을 잡은 동안 다른 모든 조회도 막혀 느려지는 문제도 함께 없어진다.
+_schema_ready = False
+_schema_lock = threading.Lock()
+
+
 def _ensure_schema(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(_SCHEMA)
-    conn.commit()
+    global _schema_ready
+    if _schema_ready:
+        return
+    with _schema_lock:
+        if _schema_ready:
+            return
+        with conn.cursor() as cur:
+            cur.execute(_SCHEMA)
+        conn.commit()
+        _schema_ready = True
 
 
 def is_enabled() -> bool:

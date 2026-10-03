@@ -4,13 +4,10 @@ external_sources.py
 DART 외 외부 소스 수집기.
 
   🟢 fetch_naver_news()        : 네이버 공식 뉴스 검색 API (합법, 권장)
-  🟡 fetch_naver_research()    : 네이버증권 리포트 '목록 메타데이터' (제목/증권사/
-                                작성일/링크). 본문 PDF는 받지 않음. 이 목록 페이지에는
-                                목표주가/투자의견 컬럼이 없어(조회수만 있음) 채우지 않는다
-                                — 목표주가는 fetch_naver_price()/fnguide consensus 사용.
-  🟢 aggregate_consensus()     : 위 리포트들에 target_price가 있는 경우에만(현재는
-                                거의 없음) 집계하는 자리— 실질적 목표주가 컨센서스는
-                                fetch_naver_price()의 target_price_mean을 사용하라.
+  🟡 fetch_naver_research()    : 네이버 모바일 증권 JSON API로 최근 90일 종목분석
+                                리포트 최신 10건(제목/증권사/작성일/투자의견/목표주가/
+                                직전 목표주가/본문 요약/PDF 링크). PDF 본문은 받지 않음.
+  🟢 aggregate_consensus()     : 위 리포트들의 목표주가/투자의견을 증권사별로 직접 집계.
   🟡 fetch_naver_price()       : 네이버 모바일 증권 JSON API(m.stock.naver.com)로
                                 현재가·52주 최고/최저·PER/PBR 조회. HTML 스크래핑이
                                 아니라 네이버 앱이 쓰는 API라 페이지 구조 변경에 강함.
@@ -143,7 +140,7 @@ def fetch_naver_news(query: str, *, display: int = 20, sort: str = "date",
 
 
 # ---------------------------------------------------------------------- #
-# 🟡 네이버증권 리포트 목록 (메타데이터만)
+# 🟡 네이버증권 종목 리포트 (모바일 JSON API — 목록 + 리포트별 상세)
 # ---------------------------------------------------------------------- #
 @dataclass
 class Report:
@@ -154,92 +151,113 @@ class Report:
     opinion: str = ""
     report_url: str = ""
     pdf_url: str = ""
+    research_id: Optional[int] = None
+    prev_target_price: Optional[int] = None   # 직전 목표주가(상향/하향 판단용)
+    price_at_write: Optional[int] = None      # 작성일 주가
+    summary: str = ""                         # 증권사가 직접 쓴 본문 요약(네이버 제공 텍스트)
 
 
-def fetch_naver_research(stock_code: str, *, cache_ttl: int = 21600) -> list[dict]:
-    """finance.naver.com 종목 리서치 목록을 긁어 메타데이터만 추출(본문 PDF 미수집).
+_NAVER_RESEARCH_LIST = "https://m.stock.naver.com/api/research/stock/{code}"
+_NAVER_RESEARCH_DETAIL = "https://m.stock.naver.com/api/research/company/{rid}"
 
-    주의: company_list.naver 목록 페이지의 실제 컬럼은 종목명/제목/증권사/첨부/작성일/
-    조회수 6개뿐이며 목표주가·투자의견 컬럼은 없다(개별 리포트 PDF 본문에만 있음).
-    그래서 target_price/opinion은 이 함수에서 채우지 않는다 — 대신 목표주가 컨센서스는
-    fetch_naver_price()(네이버 자체 컨센서스 API)나 fnguide_sources.fetch_fnguide()의
-    consensus(WiseReport cTB15)를 사용하라. 과거 버전은 '조회수' 숫자 컬럼을 목표주가로
-    오인해 집계하는 버그가 있었다(예: 004000에서 평균 2,838원처럼 실제 주가와 무관한 값).
 
-    네이버 페이지 구조/컬럼은 수시로 바뀐다. 아래 파서는 방어적으로 '있는 만큼' 뽑으며,
-    컬럼 매칭이 어긋나면 비는 값이 생긴다 => 이 어긋남을 잡아내는 게 바로
-    '파이프라인 안정성 검증' 단계의 목적. 개인 리서치 용도. 저작권 있는 리포트 PDF
-    본문은 재생산/저장하지 않는다.
+def _int_or_none(v) -> Optional[int]:
+    n = _strip_unit(v)
+    return int(n) if n else None   # 0/빈값은 '목표가 미제시'로 보고 None
+
+
+def fetch_naver_research(stock_code: str, *, days: int = 90, max_reports: int = 10,
+                         cache_ttl: int = 21600) -> list[dict]:
+    """네이버 모바일 증권 API로 최근 `days`일 이내 종목분석 리포트 최신 `max_reports`건을
+    수집한다. 목록(/api/research/stock/{code})으로 대상을 고르고, 리포트별 상세
+    (/api/research/company/{researchId})에서 투자의견·목표주가·직전 목표주가·작성일
+    주가·본문 요약·PDF 링크를 채운다.
+
+    예전 구현은 finance.naver.com/research/company_list.naver 목록 HTML을 긁었는데,
+    페이지 구조가 바뀌어 항상 0건을 반환하고 있었다(삼성전자 등으로 확인). 목록 HTML
+    에는 목표주가/의견 컬럼도 없었다. JSON API로 바꾸면서 둘 다 해결된다.
+
+    저작권: PDF 본문은 받지 않는다(pdf_url 링크만 보관). summary는 네이버가 리포트
+    상세 화면에 공개하는 요약 텍스트다. 상세 조회가 실패한 건은 목록 메타데이터만 남긴다.
     """
+    from datetime import date, timedelta
+
     code = stock_code.zfill(6)
-    ck = f"research::{code}"
+    ck = f"research_m::{code}::{days}::{max_reports}"
     cached = _cache_get(ck, cache_ttl)
     if cached:
         return cached["reports"]
 
-    url = ("https://finance.naver.com/research/company_list.naver"
-           f"?searchType=itemCode&itemCode={code}")
-    r = _request("GET", url, headers={"User-Agent": UA})
-    # 네이버 금융은 EUC-KR(cp949)
-    r.encoding = "euc-kr"
-    soup_html = r.text
+    items = _naver_mobile_json(_NAVER_RESEARCH_LIST.format(code=code) + "?pageSize=30&page=1")
+    if not isinstance(items, list):
+        raise SourceError(f"리포트 목록 응답 형식 변경: {type(items).__name__}")
 
-    reports = _parse_research_rows(soup_html)
-    _cache_put(ck, {"reports": [asdict(x) if isinstance(x, Report) else x for x in reports]})
-    return [asdict(x) if isinstance(x, Report) else x for x in reports]
+    since = (date.today() - timedelta(days=days)).isoformat()
+    recent = [it for it in items if str(it.get("writeDate", "")) >= since]
+    recent.sort(key=lambda it: (str(it.get("writeDate", "")), it.get("researchId") or 0), reverse=True)
 
+    reports: list[Report] = []
+    for it in recent[:max_reports]:
+        rid = it.get("researchId")
+        rep = Report(
+            title=str(it.get("title", "")).strip(),
+            broker=str(it.get("brokerName", "")).strip(),
+            date=str(it.get("writeDate", "")),
+            research_id=rid,
+            report_url=f"https://m.stock.naver.com/research/company/{rid}" if rid else "",
+        )
+        if rid:
+            try:
+                rc = (_naver_mobile_json(_NAVER_RESEARCH_DETAIL.format(rid=rid))
+                      .get("researchContent") or {})
+                rep.opinion = str(rc.get("opinion") or "").strip()
+                rep.target_price = _int_or_none(rc.get("goalPrice"))
+                rep.prev_target_price = _int_or_none(rc.get("prevGoalPrice"))
+                rep.price_at_write = _int_or_none(rc.get("priceAtWriteDate"))
+                rep.pdf_url = str(rc.get("attachUrl") or "")
+                # 태그를 공백으로 치환 — 제목 블록과 본문 첫 문장이 붙어버리는 것 방지
+                rep.summary = re.sub(r"\s+", " ", re.sub(
+                    r"<[^>]+>", " ", html.unescape(rc.get("content") or ""))).strip()
+            except Exception as e:  # noqa: BLE001  (상세 1건 실패 — 목록 메타데이터는 유지)
+                logger.warning("리포트 상세 조회 실패(%s/%s): %s", code, rid, e)
+        reports.append(rep)
 
-def _parse_research_rows(page: str) -> list[Report]:
-    """리서치 목록 테이블 파싱. BeautifulSoup이 있으면 쓰고, 없으면 정규식 폴백."""
-    out: list[Report] = []
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(page, "html.parser")
-        # 종목분석 리포트 목록은 table.type_1 형태
-        table = soup.select_one("table.type_1") or soup.find("table")
-        if not table:
-            return out
-        for tr in table.select("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 4:
-                continue
-            cells = [td.get_text(strip=True) for td in tds]
-            links = {a.get_text(strip=True): a.get("href", "") for a in tr.find_all("a")}
-            # 제목/증권사/날짜/PDF를 위치+휴리스틱으로 추출
-            title = next((t for t in links if t), cells[0] if cells else "")
-            report_url = links.get(title, "")
-            pdf_url = next((h for h in links.values() if h.lower().endswith(".pdf")), "")
-            # 날짜처럼 보이는 셀
-            date = next((c for c in cells if re.match(r"\d{2,4}[.\-/]\d{1,2}[.\-/]\d{1,2}", c)), "")
-            # 증권사: '증권'/'투자'/'리서치' 포함 셀 우선, 없으면 휴리스틱
-            broker = next((c for c in cells if ("증권" in c or "투자" in c or "리서치" in c)
-                           and len(c) <= 12), "")
-            if not broker:
-                broker = next((c for c in cells
-                               if c and c != title and c != date
-                               and not c.replace(",", "").isdigit() and len(c) <= 12), "")
-            # 주의: 이 목록 페이지에는 목표주가 컬럼이 없다(마지막 숫자 셀은 조회수).
-            # target_price는 채우지 않는다 — fetch_naver_price()/fnguide consensus 사용.
-            if title:
-                out.append(Report(title=title, broker=broker, date=date,
-                                  report_url=report_url, pdf_url=pdf_url))
-    except ImportError:
-        # bs4 미설치 폴백: 링크/날짜만 거칠게
-        for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>', page):
-            href, text = m.group(1), _strip_html(m.group(2))
-            if text and len(text) > 6:
-                out.append(Report(title=text, report_url=href))
+    out = [asdict(r) for r in reports]
+    _cache_put(ck, {"reports": out})
     return out
 
 
 # ---------------------------------------------------------------------- #
 # 🟢 self-built 컨센서스 (FnGuide 컨센서스 상품의 합법 대체)
 # ---------------------------------------------------------------------- #
+_OPINION_ALIASES = {
+    "강력매수": ("STRONGBUY", "STRONG BUY", "강력매수", "적극매수"),
+    "매수": ("BUY", "매수", "TRADINGBUY", "TRADING BUY", "OUTPERFORM", "OVERWEIGHT",
+             "비중확대", "단기매수", "ADD", "ACCUMULATE"),
+    "중립": ("HOLD", "NEUTRAL", "중립", "보유", "MARKETPERFORM", "MARKET PERFORM",
+             "NOTRATED", "NOT RATED", "N/R", "NR"),
+    "매도": ("SELL", "매도", "UNDERPERFORM", "UNDERWEIGHT", "비중축소", "REDUCE"),
+    "강력매도": ("STRONGSELL", "STRONG SELL", "강력매도"),
+}
+_OPINION_LOOKUP = {a.replace(" ", ""): label for label, alias in _OPINION_ALIASES.items()
+                   for a in alias}
+
+
+def normalize_opinion(op: str) -> str:
+    """증권사별 투자의견 표기를 FnGuide 라벨(강력매수/매수/중립/매도/강력매도)로 통일.
+    모르는 표기는 원문 그대로 둔다(집계에서 별도 항목으로 보이게)."""
+    raw = (op or "").strip()
+    return _OPINION_LOOKUP.get(raw.upper().replace(" ", ""), raw)
+
+
 def aggregate_consensus(reports: list[dict]) -> dict:
     """수집한 리포트들의 목표주가/투자의견을 직접 집계.
     개별 증권사가 공개한 의견을 출처와 함께 모은 것 — FnGuide 집계상품 복제 아님."""
     tps = [r["target_price"] for r in reports if r.get("target_price")]
-    opinions = [r.get("opinion", "") for r in reports if r.get("opinion")]
+    # 증권사마다 '매수'/'Buy'/'BUY'/'StrongBuy'처럼 표기가 달라 그대로 세면 같은 의견이
+    # 쪼개진다 — FnGuide 라벨 체계(강력매수/매수/중립/매도/강력매도)로 통일해서 집계
+    # (cross_check.check_opinion이 FnGuide 라벨과 다수결을 문자열 비교하기 때문).
+    opinions = [normalize_opinion(r.get("opinion", "")) for r in reports if r.get("opinion")]
     brokers = sorted({r.get("broker", "") for r in reports if r.get("broker")})
     result = {
         "n_reports": len(reports),
