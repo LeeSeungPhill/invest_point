@@ -42,6 +42,7 @@ import psycopg2.extras
 
 import analysis_history
 import mvp_graph
+import telegram_alert
 from invest_mng_sync import update_invest_mng  # 분석 후 invest_mng 반영(simul_server와 공용)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
@@ -109,18 +110,41 @@ def list_target_stocks() -> list[dict]:
         conn.close()
 
 
+_TG_MAX_LEN = 3800  # 텔레그램 sendMessage 4096자 제한 여유분
+
+
+def _fmt_stock_list(items: list[str]) -> str:
+    """종목 나열 문자열 — 너무 길면 잘라서 '외 N건'으로 표기."""
+    text = ", ".join(items)
+    if len(text) <= _TG_MAX_LEN:
+        return text
+    shown, length = [], 0
+    for it in items:
+        if length + len(it) + 2 > _TG_MAX_LEN:
+            break
+        shown.append(it)
+        length += len(it) + 2
+    return ", ".join(shown) + f" 외 {len(items) - len(shown)}건"
+
+
 def run_batch(limit: int | None = None) -> None:
+    started = time.time()
     stocks = list_target_stocks()
     if limit:
         stocks = stocks[:limit]
     if not stocks:
         log.info("배치 대상 종목이 없어 종료합니다.")
+        telegram_alert.send_alert("[주간 투자포인트 배치] 대상 종목 없음 — 종료")
         return
 
-    log.info("배치 대상 %d개 종목: %s", len(stocks),
-             ", ".join(f"{s['stock_code']}({s.get('corp_name') or '?'})" for s in stocks))
+    labels = [f"{s['stock_code']}({s.get('corp_name') or '?'})" for s in stocks]
+    log.info("배치 대상 %d개 종목: %s", len(stocks), ", ".join(labels))
+    telegram_alert.send_alert(
+        f"[주간 투자포인트 배치] 시작 — 대상 {len(stocks)}개 종목\n"
+        f"{_fmt_stock_list(labels)}")
 
     ok, failed = 0, []
+    llm_failed, sync_failed = [], []
     for i, s in enumerate(stocks, 1):
         code, name = s["stock_code"], s.get("corp_name") or "?"
         log.info("[%d/%d] %s(%s) 분석 시작", i, len(stocks), code, name)
@@ -132,6 +156,7 @@ def run_batch(limit: int | None = None) -> None:
             if result.get("llm_error"):
                 log.warning("[%d/%d] %s(%s) LLM 호출 에러: %s",
                             i, len(stocks), code, name, result["llm_error"])
+                llm_failed.append(f"{code}({name})")
             # 분석이 끝났으면 최신 이력을 invest_mng에 반영(LLM 실패 시엔 이력이 비어
             # 있을 수 있어 건너뜀). 반영 실패는 분석 성공 여부와 분리해 경고만 남긴다.
             if not result.get("llm_error"):
@@ -142,14 +167,27 @@ def run_batch(limit: int | None = None) -> None:
                         log.warning("[%d/%d] %s(%s) invest_mng 갱신 대상 행 없음", i, len(stocks), code, name)
                 except Exception:  # noqa: BLE001
                     log.exception("[%d/%d] %s(%s) invest_mng 갱신 실패", i, len(stocks), code, name)
+                    sync_failed.append(f"{code}({name})")
             ok += 1
         except Exception:  # noqa: BLE001 — 한 종목 실패가 배치 전체를 죽이면 안 됨
             log.exception("[%d/%d] %s(%s) 실패", i, len(stocks), code, name)
-            failed.append(code)
+            failed.append(f"{code}({name})")
         if i < len(stocks):
             time.sleep(INTER_STOCK_PAUSE_SEC)
 
-    log.info("배치 종료: 성공 %d / 실패 %d개 %s", ok, len(failed), failed)
+    elapsed_min = (time.time() - started) / 60
+    log.info("배치 종료: 성공 %d / 실패 %d개 %s (%.1f분)", ok, len(failed), failed, elapsed_min)
+
+    lines = [f"[주간 투자포인트 배치] 완료 — 대상 {len(stocks)}개, 소요 {elapsed_min:.1f}분",
+             f"성공 {ok}건 / 실패 {len(failed)}건"]
+    if failed:
+        lines.append(f"실패: {_fmt_stock_list(failed)}")
+    if llm_failed:
+        lines.append(f"LLM 호출 에러 {len(llm_failed)}건: {_fmt_stock_list(llm_failed)}")
+    if sync_failed:
+        lines.append(f"invest_mng 갱신 실패 {len(sync_failed)}건: {_fmt_stock_list(sync_failed)}")
+    msg = "\n".join(lines)
+    telegram_alert.send_alert(msg if len(msg) <= 4000 else msg[:4000] + "…(생략)")
 
 
 if __name__ == "__main__":
