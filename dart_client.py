@@ -58,6 +58,13 @@ _DISCL_EXCLUDE_PAT = re.compile(
     r"주주총회소집|사외이사.*선임|기타경영사항"
 )
 
+# 주주가치 희석성 자금조달(주요사항보고서 제목). '유무상증자결정'은 '유상증자결정'을
+# 부분 문자열로 포함하지 않아 따로 적는다. 무상증자는 희석이 아니므로 제외.
+_DILUTIVE_PAT = re.compile(
+    r"유상증자결정|유무상증자결정|전환사채권발행결정|신주인수권부사채권발행결정|"
+    r"교환사채권발행결정"
+)
+
 # 정기보고서 종류 코드 (reprt_code)
 REPRT_CODE = {
     "11011": "사업보고서",
@@ -338,6 +345,50 @@ class DartClient:
         result = {"corp_name": data.get("corp_name"), "induty_code": data.get("induty_code")}
         _cache_put(ck, result)
         return result
+
+    def audit_opinions(self, corp_code: str, *, cache_ttl: int = 30 * 86400) -> list:
+        """최근 사업보고서의 감사의견(당기/전기/전전기 3개년이 한 번에 온다).
+        올해 사업보고서가 아직 없을 수 있어 작년→재작년 순으로 시도한다.
+        반환: 의견 문자열 리스트(연결·별도 행이 각각 있어 중복 포함). 못 찾으면 []."""
+        ck = f"dart_audit::{corp_code}"
+        cached = _cache_get(ck, cache_ttl)
+        if cached is not None:
+            return cached.get("opinions", [])
+        this_year = int(time.strftime("%Y"))
+        opinions: list = []
+        for year in (this_year - 1, this_year - 2):
+            data = self._get("accnutAdtorNmNdAdtOpinion.json", corp_code=corp_code,
+                             bsns_year=str(year), reprt_code="11011").json()
+            if data.get("status") == "013":
+                continue
+            self._check_json_status(data, "accnutAdtorNmNdAdtOpinion.json")
+            opinions = [(x.get("adt_opinion") or "").strip() for x in data.get("list", [])]
+            opinions = [o for o in opinions if o and o != "-"]
+            if opinions:
+                break
+        _cache_put(ck, {"opinions": opinions})
+        return opinions
+
+    def dilutive_financing_count(self, corp_code: str, *, lookback_days: int = 730,
+                                 cache_ttl: int = 86400) -> int:
+        """lookback_days 동안 낸 희석성 자금조달(유상증자·CB·BW·EB 발행결정)
+        주요사항보고서 건수. 정정공시는 같은 건을 두 번 세지 않도록 뺀다."""
+        ck = f"dart_dilutive::{corp_code}:{lookback_days}"
+        cached = _cache_get(ck, cache_ttl)
+        if cached is not None:
+            return cached.get("count", 0)
+        end = time.strftime("%Y%m%d")
+        bgn = time.strftime("%Y%m%d", time.localtime(time.time() - lookback_days * 86400))
+        data = self._get("list.json", corp_code=corp_code, bgn_de=bgn, end_de=end,
+                         pblntf_ty="B", page_count=100).json()
+        count = 0
+        if data.get("status") != "013":
+            self._check_json_status(data, "list.json(dilutive)")
+            count = sum(1 for x in data.get("list", [])
+                        if _DILUTIVE_PAT.search(x.get("report_nm", ""))
+                        and "정정" not in x.get("report_nm", ""))
+        _cache_put(ck, {"count": count})
+        return count
 
     # ------------------------------------------------------------------ #
     # 5) 사업의 개요 (정확한 섹션 offset 기반) — RAG용 전체 "사업의 내용"과 별개로

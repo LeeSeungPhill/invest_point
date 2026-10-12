@@ -395,6 +395,92 @@ def fetch_listing_age(stock_code: str, *, cache_ttl: int = 7 * 86400) -> dict:
     return {"listed_date": listed_date, "years_listed": round((date.today() - d).days / 365.25, 1)}
 
 
+def fetch_daily_closes(stock_code: str, *, pages: int = 2, cache_ttl: int = 3600) -> list[dict]:
+    """일별 종가(최신순 → 오래된순으로 뒤집어 반환: [{date:'YYYY-MM-DD', close}]).
+    네이버 모바일 API는 pageSize 60이 상한이라(120은 HTTP 400, 실측) 페이지를
+    나눠 받는다. 기본 2페이지 ≈ 120거래일(약 6개월)."""
+    code = stock_code.zfill(6)
+    ck = f"naver_daily::{code}:{pages}"
+    cached = _cache_get(ck, cache_ttl)
+    if cached is not None:
+        return cached.get("rows", [])
+    rows = []
+    for page in range(1, pages + 1):
+        data = _naver_mobile_json(
+            f"https://m.stock.naver.com/api/stock/{code}/price?pageSize=60&page={page}")
+        if not isinstance(data, list) or not data:
+            break
+        for d in data:
+            close = _strip_unit(d.get("closePrice"))
+            if d.get("localTradedAt") and close is not None:
+                rows.append({"date": d["localTradedAt"][:10], "close": close})
+    rows.sort(key=lambda r: r["date"])
+    _cache_put(ck, {"rows": rows})
+    return rows
+
+
+_KIND_WARN_URL = "https://kind.krx.co.kr/investwarn/investattentwarnrisky.do"
+_KIND_WARN_REF = _KIND_WARN_URL + "?method=investattentwarnriskyMain"
+
+
+def _kind_table(session, url: str, data: dict, headers: dict):
+    import pandas as pd
+    from io import StringIO
+    r = session.post(url, data=data, headers=headers, timeout=20)
+    r.raise_for_status()
+    r.encoding = "EUC-KR"
+    df = pd.read_html(StringIO(r.text), header=0, converters={"종목코드": str})[0]
+    df["종목코드"] = df["종목코드"].astype(str).str.strip().str.zfill(6)
+    return df
+
+
+def fetch_market_warnings(*, caution_lookback_days: int = 7, cache_ttl: int = 6 * 3600) -> dict:
+    """KRX KIND 시장경보 목록을 종목코드 집합으로 반환(전 종목 공통이라 통째로 캐시).
+      admin   : 관리종목
+      caution : 투자주의(하루짜리 지정이라 최근 caution_lookback_days일 내 지정분)
+      warning : 투자경고(해제일이 '-'이거나 오늘 이후 = 현재 지정 중)
+      risk    : 투자위험(동일 기준)
+    투자주의/경고/위험은 세션 쿠키와 Referer가 있어야 표가 오고(없으면 안내
+    페이지가 옴, 실측), 관리종목은 그냥 POST로 받아진다."""
+    cached = _cache_get("kind_market_warnings", cache_ttl)
+    if cached is not None:
+        return {k: set(v) for k, v in cached.items()}
+
+    from datetime import date, timedelta
+    today = date.today()
+    hdr = {"User-Agent": "Mozilla/5.0", "Referer": _KIND_WARN_REF}
+    s = requests.Session()
+    s.get(_KIND_WARN_REF, headers=hdr, timeout=20)
+
+    admin = _kind_table(s, "https://kind.krx.co.kr/investwarn/adminissue.do", {
+        "method": "searchAdminIssueSub", "currentPageSize": "3000", "pageIndex": "1",
+        "orderMode": "1", "orderStat": "D", "forward": "adminissue_down"}, hdr)
+
+    def _warn(menu: str, forward: str, start):
+        return _kind_table(s, _KIND_WARN_URL, {
+            "method": "investattentwarnriskySub", "currentPageSize": "3000", "pageIndex": "1",
+            "orderMode": "4", "orderStat": "D", "searchCodeType": "", "searchCorpName": "",
+            "forward": forward, "marketType": "", "menuIndex": menu, "repIsuSrtCd": "",
+            "startDate": start.isoformat(), "endDate": today.isoformat()}, hdr)
+
+    caution = _warn("1", "invstcautnisu_down", today - timedelta(days=caution_lookback_days))
+    warning = _warn("2", "invstwarnisu_down", today - timedelta(days=365))
+    risk = _warn("3", "invstriskisu_down", today - timedelta(days=365))
+
+    def _active(df) -> set:
+        rel = df["해제일"].astype(str).str.strip()
+        return set(df.loc[(rel == "-") | (rel >= today.isoformat()), "종목코드"])
+
+    result = {
+        "admin": set(admin["종목코드"]),
+        "caution": set(caution["종목코드"]),
+        "warning": _active(warning),
+        "risk": _active(risk),
+    }
+    _cache_put("kind_market_warnings", {k: sorted(v) for k, v in result.items()})
+    return result
+
+
 # ---------------------------------------------------------------------- #
 # 네이버 종목분석 > Financial Summary (출처: navercomp.wisereport.co.kr / FnGuide)
 #   연간/분기/예상((E)) 매출액·영업이익·당기순이익. 단위: 억원.

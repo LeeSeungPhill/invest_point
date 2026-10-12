@@ -79,6 +79,7 @@ import stability_score
 import analysis_history
 import telegram_alert
 import value_investment_check
+import watchlist_screen
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -118,6 +119,7 @@ class AnalysisState(TypedDict, total=False):
     report: str                 # 최종 LLM 리포트
     investment_summary: str     # 4단계: 컨센서스 + 리포트 결합 투자포인트 요약
     value_investment: str       # 5단계: quality_signal True인 종목만 — 가치주 점검 결과
+    watchlist: dict             # 트레이딩 계획서 관심종목 편입 판정(watchlist_screen.py)
     rag_skip: bool              # Ollama 헬스체크 실패 시 이번 실행 임베딩 검색 생략(run에서 주입)
     llm_error: str              # analyze 단계(import/init/llm) 에러 메시지를 최상위로 노출
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
@@ -422,6 +424,7 @@ def save_history(state: AnalysisState) -> AnalysisState:
             stability=state.get("stability"),
             annual_highlight=(state.get("fnguide") or {}).get("annual_highlight"),
             value_invest=state.get("value_investment"),
+            watchlist_types=",".join((state.get("watchlist") or {}).get("types") or []) or None,
         )
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
@@ -514,6 +517,86 @@ def check_value_investment(state: AnalysisState) -> AnalysisState:
     text = value_investment_check.filter_low_info_sections(text)
 
     return {"value_investment": text}
+
+
+def screen_watchlist(state: AnalysisState) -> AnalysisState:
+    """트레이딩 계획서 2장 '관심종목 선정' 판정(watchlist_screen.py) 후, 새로
+    편입된 유형이 있으면 텔레그램으로 알린다. 판정 결과(편입 유형)는 save_history가
+    analysis_history.watchlist_types에 저장하고, 다음 실행은 직전 값과 비교해
+    새로 생긴 유형만 알린다(주간 배치가 매주 같은 알림을 반복하지 않도록).
+
+    비싼 조회는 앞 단계를 통과한 종목만 한다: 52주 고점 대비 -30% 미달이면 바로
+    종료, D의 실적 조건이 맞을 때만 일별 시세 조회, 유형이 하나라도 맞을 때만
+    감사의견·시장경보·유상증자/CB 조회. 조회 실패는 편입 '통과'로 치지 않는다."""
+    code, name = state.get("stock_code"), state.get("corp_name")
+    price, fnguide = state.get("price") or {}, state.get("fnguide") or {}
+    ws = watchlist_screen
+    dd = ws.drawdown_pct(price)
+
+    matched: list = []
+    if dd is not None and dd <= ws.DRAWDOWN_THRESHOLD_PCT:
+        q = ws.quarterly_actuals(fnguide)
+        try:
+            import hankyung_consensus
+            revisions = hankyung_consensus.fetch_estimate_revisions(code, name or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("한경컨센서스 조회 실패(%s): %s", code, e)
+            revisions = {}
+        for t, fn in (("A", lambda: ws.type_a(revisions)), ("B", lambda: ws.type_b(q)),
+                      ("C", lambda: ws.type_c(q))):
+            ok, ev = fn()
+            if ok:
+                matched.append({"type": t, "evidence": ev})
+        d_ok, d_ev = ws.type_d_fundamental(q)
+        if d_ok and ws.release_matches_latest_quarter(state.get("report_nm"), q):
+            try:
+                from external_sources import fetch_daily_closes
+                chg = ws.post_release_change_pct(fetch_daily_closes(code), state.get("rcept_dt"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("일별 시세 조회 실패(%s): %s", code, e)
+                chg = None
+            if chg is not None and chg <= ws.POST_RELEASE_SIDEWAYS_PCT:
+                matched.append({"type": "D", "evidence": f"{d_ev}, 실적 발표 후 주가 {chg:+.1f}%"})
+
+    checklist: dict = {}
+    exclusions: list = []
+    unknown: list = []
+    if matched:
+        corp_code = state.get("corp_code")
+        try:
+            audit = _dart.audit_opinions(corp_code)
+        except Exception as e:  # noqa: BLE001
+            log.warning("감사의견 조회 실패(%s): %s", code, e)
+            audit = None
+        checklist = ws.evaluate_checklist((state.get("stability") or {}).get("financial"), audit)
+        try:
+            from external_sources import fetch_market_warnings
+            warnings = fetch_market_warnings()
+        except Exception as e:  # noqa: BLE001
+            log.warning("KRX 시장경보 조회 실패: %s", e)
+            warnings = None
+            unknown.append("시장경보")
+        try:
+            dilution = _dart.dilutive_financing_count(corp_code)
+        except Exception as e:  # noqa: BLE001
+            log.warning("유상증자·CB 이력 조회 실패(%s): %s", code, e)
+            dilution = None
+            unknown.append("유상증자·CB 이력")
+        exclusions = ws.evaluate_exclusions(code, warnings, dilution)
+
+    result = ws.finalize(matched, dd, checklist, exclusions, unknown)
+    if not result["eligible"]:
+        log.info("관심종목 편입 미해당(%s/%s): %s", code, name, ws.explain(result))
+        return {"watchlist": result}
+
+    prev_row = (state.get("history") or [{}])[0]
+    prev_types = set(filter(None, (prev_row.get("watchlist_types") or "").split(",")))
+    new_types = [t for t in result["types"] if t not in prev_types]
+    log.info("관심종목 편입(%s/%s): %s (신규 %s)", code, name, ",".join(result["types"]),
+             ",".join(new_types) or "없음")
+    if new_types:
+        telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+    return {"watchlist": result}
 
 
 _SECTION_TAG_ALT = "|".join(re.escape(t) for t in SECTION_TAGS)
@@ -1057,6 +1140,11 @@ def build_graph():
     # 각각 전용 노드 인스턴스로 분리한다.
     g.add_node("check_value_investment", check_value_investment)
     g.add_node("check_value_investment_2", check_value_investment)
+    # 관심종목 편입 판정 + 텔레그램: 같은 이유로 save_history 직전에 선형으로,
+    # 경로별 전용 인스턴스로 둔다(편입 유형을 같은 행에 저장해야 다음 실행이
+    # 직전 값과 비교해 신규 편입만 알릴 수 있다).
+    g.add_node("screen_watchlist", screen_watchlist)
+    g.add_node("screen_watchlist_2", screen_watchlist)
 
     g.add_edge(START, "resolve_corp")
     # 사업보고서 체인: 본문(RAG) + 사업의 개요(합성 청크) → rag_retrieve에서 병합 → analyze
@@ -1110,11 +1198,13 @@ def build_graph():
     g.add_edge("verify_citations_2", "verify_scenario_2")
     # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 4단계 요약 → 저장 노드를 거쳐 END로
     g.add_edge("build_summary", "check_value_investment")
-    g.add_edge("check_value_investment", "save_history")
+    g.add_edge("check_value_investment", "screen_watchlist")
+    g.add_edge("screen_watchlist", "save_history")
     g.add_edge("save_history", END)
     g.add_edge("verify_scenario_2", "build_summary_2")
     g.add_edge("build_summary_2", "check_value_investment_2")
-    g.add_edge("check_value_investment_2", "save_history_2")
+    g.add_edge("check_value_investment_2", "screen_watchlist_2")
+    g.add_edge("screen_watchlist_2", "save_history_2")
     g.add_edge("save_history_2", END)
     return g.compile()
 
@@ -1228,6 +1318,16 @@ if __name__ == "__main__":
                   f"리포트 절: {sc['signal_check']['section'][:80]}")
         if sc.get("unverified_numbers"):
             print(f"   - 미검증 파생수치: {sc['unverified_numbers'][:5]}")
+
+    wl = result.get("watchlist")
+    if wl:
+        print("\n--- 관심종목 편입 판정(트레이딩 계획서 2장) ---")
+        if wl.get("eligible"):
+            print(f" 편입: {','.join(wl['types'])} (52주 고점 대비 {wl['drawdown_pct']}%)")
+            for m in wl["matched"]:
+                print(f"   - {m['type']}. {watchlist_screen.TYPE_LABELS[m['type']]}: {m['evidence']}")
+        else:
+            print(f" 미해당: {watchlist_screen.explain(wl)}")
 
     value_investment = result.get("value_investment")
     if value_investment:

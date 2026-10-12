@@ -131,6 +131,9 @@ ALTER TABLE analysis_history DROP COLUMN IF EXISTS value_score;
 -- 5단계: quality_signal 통과 종목의 가치주 점검 결과(원래 invest_mng.value_invest에
 -- 저장했다가 사용자 요청으로 여기로 이전).
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS value_invest TEXT;
+-- 트레이딩 계획서 관심종목 편입 유형(예: 'A,C', 미편입이면 NULL). 다음 실행이
+-- 직전 값과 비교해 새로 편입된 유형만 텔레그램으로 알리는 데 쓴다.
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS watchlist_types TEXT;
 """ + "\n".join(
     f'ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS "{col}" DOUBLE PRECISION;'
     for col in _ANNUAL_COLUMNS
@@ -183,7 +186,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             investment_summary: Optional[str] = None,
             stability: Optional[dict] = None,
             annual_highlight: Optional[list] = None,
-            value_invest: Optional[str] = None) -> None:
+            value_invest: Optional[str] = None,
+            watchlist_types: Optional[str] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
@@ -204,10 +208,10 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                    (stock_code, corp_name, run_at, report_nm, rcept_dt, growth_trend,
                     op_yoy_forward, value_signal, band_position, target_upside_pct, price,
                     citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
-                    regenerated, report, investment_summary, value_invest,
+                    regenerated, report, investment_summary, value_invest, watchlist_types,
                     earnings_stability_score, financial_stability_score,
                     {annual_col_sql})
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                            {annual_placeholders})""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
@@ -224,7 +228,7 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  (citation_report or {}).get("avg_grounding"),
                  bool((cross_check or {}).get("all_ok", True)),
                  (scenario_consistency or {}).get("verdict"),
-                 bool(regenerated), report, investment_summary, value_invest,
+                 bool(regenerated), report, investment_summary, value_invest, watchlist_types,
                  earnings_stability.get("score"), financial_stability.get("score"),
                  *[annual_vals.get(c) for c in _ANNUAL_COLUMNS]),
             )
