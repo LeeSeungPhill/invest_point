@@ -595,7 +595,15 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
     log.info("관심종목 편입(%s/%s): %s (신규 %s)", code, name, ",".join(result["types"]),
              ",".join(new_types) or "없음")
     if new_types:
-        telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+        # 이미 관심종목(interestItem_interest_item)으로 등록된 종목은 알릴 필요가
+        # 없다(사용자 요청). 조회 실패(None)도 '미등록'으로 단정할 수 없어 보내지 않는다.
+        import invest_mng_lookup
+        registered = invest_mng_lookup.is_registered_interest_item(code)
+        if registered is False:
+            telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+        else:
+            log.info("관심종목 편입 알림 생략(%s/%s): %s", code, name,
+                     "이미 관심종목에 등록됨" if registered else "관심종목 등록 여부 조회 실패")
     return {"watchlist": result}
 
 

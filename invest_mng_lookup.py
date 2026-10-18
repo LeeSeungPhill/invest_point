@@ -69,3 +69,29 @@ def fetch_high_price(stock_code: str) -> Optional[float]:
     except Exception as e:  # noqa: BLE001
         logger.warning("invest_mng.high_price 조회 실패(%s): %s", stock_code, e)
         return None
+
+
+def is_registered_interest_item(stock_code: str, *, nick_name: str = "phills75") -> Optional[bool]:
+    """이미 관심종목(interestItem_interest_item, proc_yn='Y')으로 등록된 종목인지.
+    '0001'/'1001'(지수 코드)은 제외. 관심종목 편입 텔레그램을 이미 등록된 종목에는
+    보내지 않기 위해 쓴다(사용자 요청). 조회에 실패하면 '미등록'으로 단정할 수
+    없으므로 None을 반환한다 — 호출부가 이 경우 전송하지 않는다."""
+    if not stock_code:
+        return None
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'SELECT 1 FROM public."interestItem_interest_item" '
+                    "WHERE code NOT IN ('0001', '1001') AND proc_yn = 'Y' AND code = %s "
+                    'AND acct_no IN (SELECT acct_no FROM public."stockAccount_stock_account" '
+                    "WHERE nick_name = %s) LIMIT 1",
+                    (stock_code.zfill(6), nick_name),
+                )
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("관심종목 등록 여부 조회 실패(%s): %s", stock_code, e)
+        return None
