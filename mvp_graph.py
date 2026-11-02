@@ -80,6 +80,7 @@ import analysis_history
 import telegram_alert
 import value_investment_check
 import watchlist_screen
+import dividend_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("mvp")
@@ -120,6 +121,7 @@ class AnalysisState(TypedDict, total=False):
     investment_summary: str     # 4단계: 컨센서스 + 리포트 결합 투자포인트 요약
     value_investment: str       # 5단계: quality_signal True인 종목만 — 가치주 점검 결과
     watchlist: dict             # 트레이딩 계획서 관심종목 편입 판정(watchlist_screen.py)
+    dividend: dict              # TTM/실효 DPS·배당 안정성 점수(dividend_metrics.py)
     rag_skip: bool              # Ollama 헬스체크 실패 시 이번 실행 임베딩 검색 생략(run에서 주입)
     llm_error: str              # analyze 단계(import/init/llm) 에러 메시지를 최상위로 노출
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
@@ -425,6 +427,7 @@ def save_history(state: AnalysisState) -> AnalysisState:
             annual_highlight=(state.get("fnguide") or {}).get("annual_highlight"),
             value_invest=state.get("value_investment"),
             watchlist_types=",".join((state.get("watchlist") or {}).get("types") or []) or None,
+            dividend=state.get("dividend"),
         )
     except Exception as e:  # noqa: BLE001
         return {"errors": _append_error(state, "save_history", e)}
@@ -605,6 +608,37 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
             log.info("관심종목 편입 알림 생략(%s/%s): %s", code, name,
                      "이미 관심종목에 등록됨" if registered else "관심종목 등록 여부 조회 실패")
     return {"watchlist": result}
+
+
+def build_dividend(state: AnalysisState) -> AnalysisState:
+    """배당: TTM DPS(특별분 차감) → 실효 DPS(5년 평균 대비 이상치 보정)와 배당 안정성
+    점수(dividend_metrics.py). 결과는 save_history가 analysis_history에 저장하고,
+    invest_mng_sync가 그 값으로 invest_mng.dividend_rate/dividend_check를 갱신한다.
+    5년 평균은 analysis_history의 DPS-5~DPS-1과 같은 값(FnGuide 연간 실측 DPS)을 쓴다."""
+    corp_code = state.get("corp_code")
+    if not corp_code:
+        return {}
+    dm = dividend_metrics
+    out: dict = {"flags": []}
+    errors: list = []
+    try:
+        ttm = dm.ttm_dps(_dart.dividend_decisions(corp_code))
+        actual = [r.get("dps") for r in ((state.get("fnguide") or {}).get("annual_highlight") or [])
+                  if not r.get("is_estimate")][-5:]
+        positive = [v for v in actual if v]
+        avg5 = sum(positive) / len(positive) if positive else None
+        eff, outlier_flags = dm.effective_dps(ttm["ttm_adj"], avg5)
+        out.update(dps_ttm=ttm["ttm_raw"], dps_ttm_adj=ttm["ttm_adj"], dps_effective=eff,
+                   anchor=ttm["anchor"], avg5=round(avg5, 1) if avg5 else None,
+                   flags=ttm["flags"] + outlier_flags)
+    except Exception as e:  # noqa: BLE001
+        errors += _append_error(state, "build_dividend(ttm)", e)
+    try:
+        st = dm.stability_score(_dart.dividend_history(corp_code))
+        out.update(score=st.get("score"), check_text=st.get("text"))
+    except Exception as e:  # noqa: BLE001
+        errors += _append_error(state, "build_dividend(stability)", e)
+    return {"dividend": out, **({"errors": errors} if errors else {})}
 
 
 _SECTION_TAG_ALT = "|".join(re.escape(t) for t in SECTION_TAGS)
@@ -1153,6 +1187,8 @@ def build_graph():
     # 직전 값과 비교해 신규 편입만 알릴 수 있다).
     g.add_node("screen_watchlist", screen_watchlist)
     g.add_node("screen_watchlist_2", screen_watchlist)
+    g.add_node("build_dividend", build_dividend)
+    g.add_node("build_dividend_2", build_dividend)
 
     g.add_edge(START, "resolve_corp")
     # 사업보고서 체인: 본문(RAG) + 사업의 개요(합성 청크) → rag_retrieve에서 병합 → analyze
@@ -1207,12 +1243,14 @@ def build_graph():
     # 두 종료 경로(재생성 없음 / 1회 재생성 후) 각각 4단계 요약 → 저장 노드를 거쳐 END로
     g.add_edge("build_summary", "check_value_investment")
     g.add_edge("check_value_investment", "screen_watchlist")
-    g.add_edge("screen_watchlist", "save_history")
+    g.add_edge("screen_watchlist", "build_dividend")
+    g.add_edge("build_dividend", "save_history")
     g.add_edge("save_history", END)
     g.add_edge("verify_scenario_2", "build_summary_2")
     g.add_edge("build_summary_2", "check_value_investment_2")
     g.add_edge("check_value_investment_2", "screen_watchlist_2")
-    g.add_edge("screen_watchlist_2", "save_history_2")
+    g.add_edge("screen_watchlist_2", "build_dividend_2")
+    g.add_edge("build_dividend_2", "save_history_2")
     g.add_edge("save_history_2", END)
     return g.compile()
 
@@ -1326,6 +1364,15 @@ if __name__ == "__main__":
                   f"리포트 절: {sc['signal_check']['section'][:80]}")
         if sc.get("unverified_numbers"):
             print(f"   - 미검증 파생수치: {sc['unverified_numbers'][:5]}")
+
+    dv = result.get("dividend")
+    if dv:
+        print("\n--- 배당(TTM·이상치 보정·안정성) ---")
+        print(f" TTM DPS {dv.get('dps_ttm')}원(특별분 차감 {dv.get('dps_ttm_adj')}원, 기준일 "
+              f"{dv.get('anchor')}) / 5년 평균 {dv.get('avg5')}원 → 실효 DPS {dv.get('dps_effective')}원")
+        for f in dv.get("flags") or []:
+            print(f"   - {f}")
+        print(f" {dv.get('check_text') or '배당 안정성 점수 계산 불가'}")
 
     wl = result.get("watchlist")
     if wl:

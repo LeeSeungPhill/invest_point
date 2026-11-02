@@ -67,6 +67,20 @@ def _grew_or_similar(base, nxt, tolerance: float = -0.05) -> bool:
     return (nxt_f - base_f) / base_f >= tolerance
 
 
+def compute_dividend_rate(row: dict) -> float | None:
+    """배당율(%) = 실효 DPS / 현재가. 실효 DPS는 analysis_history.dps_effective
+    (TTM에서 특별분을 빼고 5년 평균 대비 이상치를 보정한 값 — dividend_metrics.py).
+    기존 게이트는 그대로 둔다(사용자 확정): DPS-5~DPS-1이 모두 존재·양수이고 매출이
+    증가/유사(_grew_or_similar)일 때만 계산. simul_server._get_invest_point_fields도
+    이 함수를 써서 투자관리 화면과 주간 배치가 같은 값을 보게 한다."""
+    price, dps = row.get("price"), row.get("dps_effective")
+    dps_vals = [row.get(f"DPS-{n}") for n in (5, 4, 3, 2, 1)]
+    if not (all(v is not None and v > 0 for v in dps_vals) and price and dps is not None
+            and _grew_or_similar(row.get("매출액-1"), row.get("매출액+1"))):
+        return None
+    return round(float(dps) / float(price) * 100, 2)
+
+
 def update_invest_mng(code: str) -> bool:
     """분석 완료 후 analysis_history 최신 이력을 읽어 invest_mng(proc_yn='Y')의 해당
     컬럼을 갱신한다(simul_server._get_invest_point_fields + invest_mng_apply의 UPDATE와
@@ -81,11 +95,7 @@ def update_invest_mng(code: str) -> bool:
     sales_amt, ep_sales_amt = row.get("매출액-1"), row.get("매출액+1")
     sales_ok = _grew_or_similar(sales_amt, ep_sales_amt)
 
-    # 배당율: DPS-5~DPS-1이 모두 존재·양수 + 매출 증가/유사일 때만 평균 DPS/현재가
-    dps_vals = [row.get(f"DPS-{n}") for n in (5, 4, 3, 2, 1)]
-    dividend_rate = None
-    if all(v is not None and v > 0 for v in dps_vals) and price and sales_ok:
-        dividend_rate = round(sum(float(v) for v in dps_vals) / len(dps_vals) / float(price) * 100, 2)
+    dividend_rate = compute_dividend_rate(row)
 
     # 매출증가율: 금년 매출액 대비 내년(추정) 매출액 상승률
     sales_rate = None
@@ -121,6 +131,13 @@ def update_invest_mng(code: str) -> bool:
                     invest_point = COALESCE(%s, invest_point),
                     invest_risk = COALESCE(%s, invest_risk),
                     value_invest = COALESCE(%s, value_invest),
+                    -- 배당 안정성 점수: dividend_check는 투자관리 화면에서 직접 입력하는
+                    -- 칸이기도 하다. 비어 있거나 이전 자동값('[자동]'으로 시작)일 때만
+                    -- 덮어써서 사용자가 적어 둔 메모를 지우지 않는다.
+                    dividend_check = CASE
+                        WHEN %s::text IS NOT NULL AND (dividend_check IS NULL
+                             OR trim(dividend_check) = '' OR dividend_check LIKE %s)
+                        THEN %s ELSE dividend_check END,
                     check_dt = %s, mod_dt = now()
                 WHERE code = %s AND proc_yn = 'Y'
                 """,
@@ -128,6 +145,7 @@ def update_invest_mng(code: str) -> bool:
                  row.get("rcept_dt") or None,
                  parsed["invest_issue"] or None, parsed["invest_point"] or None,
                  parsed["invest_risk"] or None, row.get("value_invest") or None,
+                 row.get("dividend_check"), "[자동]%", row.get("dividend_check"),
                  datetime.now().strftime("%Y%m%d"), code),
             )
             updated = cur.rowcount > 0

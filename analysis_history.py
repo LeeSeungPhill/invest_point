@@ -134,6 +134,14 @@ ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS value_invest TEXT;
 -- 트레이딩 계획서 관심종목 편입 유형(예: 'A,C', 미편입이면 NULL). 다음 실행이
 -- 직전 값과 비교해 새로 편입된 유형만 텔레그램으로 알리는 데 쓴다.
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS watchlist_types TEXT;
+-- 배당(dividend_metrics.py): TTM DPS(원값/특별분 차감), 실효 DPS(이상치 보정 후 —
+-- invest_mng.dividend_rate의 분자), 보정 사유, 배당 안정성 점수(0~100)와 그 설명문.
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dps_ttm DOUBLE PRECISION;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dps_ttm_adj DOUBLE PRECISION;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dps_effective DOUBLE PRECISION;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dividend_flags TEXT;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dividend_score INTEGER;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS dividend_check TEXT;
 """ + "\n".join(
     f'ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS "{col}" DOUBLE PRECISION;'
     for col in _ANNUAL_COLUMNS
@@ -187,7 +195,8 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
             stability: Optional[dict] = None,
             annual_highlight: Optional[list] = None,
             value_invest: Optional[str] = None,
-            watchlist_types: Optional[str] = None) -> None:
+            watchlist_types: Optional[str] = None,
+            dividend: Optional[dict] = None) -> None:
     """이번 실행의 핵심 결과를 이력에 남긴다. 실패해도 그래프를 죽이지 않도록
     호출부(mvp_graph.save_history)에서 예외를 잡는다."""
     if not is_enabled() or not stock_code:
@@ -196,6 +205,7 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
     valuation = (invest_point or {}).get("valuation", {})
     earnings_stability = (stability or {}).get("earnings") or {}
     financial_stability = (stability or {}).get("financial") or {}
+    div = dividend or {}
     annual_vals = _annual_offset_values(annual_highlight)
     annual_col_sql = ", ".join(f'"{c}"' for c in _ANNUAL_COLUMNS)
     annual_placeholders = ", ".join(["%s"] * len(_ANNUAL_COLUMNS))
@@ -210,8 +220,11 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                     citation_verdict, avg_grounding, cross_check_ok, scenario_verdict,
                     regenerated, report, investment_summary, value_invest, watchlist_types,
                     earnings_stability_score, financial_stability_score,
+                    dps_ttm, dps_ttm_adj, dps_effective, dividend_flags, dividend_score,
+                    dividend_check,
                     {annual_col_sql})
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           %s,%s,%s,%s,%s,%s,
                            {annual_placeholders})""",
                 (stock_code, corp_name, time.strftime("%Y-%m-%d %H:%M:%S"), report_nm, rcept_dt,
                  growth.get("trend"), growth.get("op_yoy_forward"),
@@ -230,6 +243,9 @@ def save_run(*, stock_code: str, corp_name: Optional[str] = None,
                  (scenario_consistency or {}).get("verdict"),
                  bool(regenerated), report, investment_summary, value_invest, watchlist_types,
                  earnings_stability.get("score"), financial_stability.get("score"),
+                 div.get("dps_ttm"), div.get("dps_ttm_adj"), div.get("dps_effective"),
+                 " / ".join(div.get("flags") or []) or None, div.get("score"),
+                 div.get("check_text"),
                  *[annual_vals.get(c) for c in _ANNUAL_COLUMNS]),
             )
         conn.commit()

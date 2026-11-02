@@ -390,6 +390,109 @@ class DartClient:
         _cache_put(ck, {"count": count})
         return count
 
+    def _document_text(self, rcept_no: str) -> str:
+        """공시 원문(document.xml ZIP)의 본문 평문. 접수된 공시는 바뀌지 않으므로
+        사실상 영구 캐시한다(정정은 새 접수번호로 온다)."""
+        ck = f"dart_doc_text::{rcept_no}"
+        cached = _cache_get(ck, 3650 * 86400)
+        if cached is not None:
+            return cached.get("text", "")
+        resp = self._get("document.xml", rcept_no=rcept_no)
+        if resp.content[:2] != b"PK":
+            raise DartError(f"원본이 ZIP이 아닙니다({rcept_no}).")
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            docs = [_decode(zf.read(n)) for n in zf.namelist()
+                    if n.lower().endswith((".xml", ".html", ".htm"))]
+        text = _xml_to_text(max(docs, key=len)) if docs else ""
+        _cache_put(ck, {"text": text})
+        return text
+
+    def dividend_decisions(self, corp_code: str, *, lookback_days: int = 550,
+                           cache_ttl: int = 86400) -> list:
+        """최근 lookback_days 동안의 '현금ㆍ현물배당결정' 거래소 공시를 해석해 접수
+        오래된순으로 반환: [{rcept_no, rcept_dt, title, div_type, dps, record_date,
+        special_mention}]. 자회사 배당결정('자회사의 주요경영사항')은 이 회사 배당이
+        아니므로 뺀다. 정정공시는 그대로 넣고, 기준일별 마지막 공시를 쓰는 처리는
+        dividend_metrics.ttm_dps가 한다."""
+        from dividend_metrics import parse_dividend_doc
+        ck = f"dart_dividends::{corp_code}:{lookback_days}"
+        cached = _cache_get(ck, cache_ttl)
+        if cached is not None:
+            return cached.get("events", [])
+        end = time.strftime("%Y%m%d")
+        bgn = time.strftime("%Y%m%d", time.localtime(time.time() - lookback_days * 86400))
+        items: list = []
+        for page in range(1, 6):
+            data = self._get("list.json", corp_code=corp_code, bgn_de=bgn, end_de=end,
+                             pblntf_ty="I", page_no=page, page_count=100).json()
+            if data.get("status") == "013":
+                break
+            self._check_json_status(data, "list.json(dividends)")
+            items += data.get("list", [])
+            if page >= int(data.get("total_page") or 1):
+                break
+        events = []
+        for x in sorted(items, key=lambda x: x.get("rcept_no", "")):
+            nm = x.get("report_nm", "")
+            if "배당결정" not in nm or "자회사" in nm:
+                continue
+            parsed = parse_dividend_doc(self._document_text(x["rcept_no"]))
+            events.append({"rcept_no": x["rcept_no"], "rcept_dt": x.get("rcept_dt"),
+                           "title": nm.strip(), **parsed})
+        _cache_put(ck, {"events": events})
+        return events
+
+    def dividend_history(self, corp_code: str, *, n_reports: int = 4,
+                         cache_ttl: int = 30 * 86400) -> dict:
+        """사업보고서 '배당에 관한 사항'(alotMatter)으로 연도별 보통주 주당 현금배당금·
+        주당액면가액·(연결)현금배당성향을 모은다. 보고서 1건이 당기/전기/전전기 3개년을
+        주므로 3년씩 건너뛰며 n_reports건(약 12년, OpenDART는 2015년분부터) 조회.
+        반환: {연도: {dps, par, payout}} — 무배당('-')은 dps 0."""
+        ck = f"dart_alot::{corp_code}:{n_reports}"
+        cached = _cache_get(ck, cache_ttl)
+        if cached is not None:
+            return {int(y): v for y, v in cached.get("history", {}).items()}
+        this_year = int(time.strftime("%Y"))
+        history: dict = {}
+        start = None
+        for year in (this_year - 1, this_year - 2):
+            data = self._get("alotMatter.json", corp_code=corp_code,
+                             bsns_year=str(year), reprt_code="11011").json()
+            if data.get("status") == "000":
+                start = year
+                break
+        if start is not None:
+            for i in range(n_reports):
+                year = start - 3 * i
+                if i:
+                    data = self._get("alotMatter.json", corp_code=corp_code,
+                                     bsns_year=str(year), reprt_code="11011").json()
+                    if data.get("status") != "000":
+                        break
+                cols = (("thstrm", year), ("frmtrm", year - 1), ("lwfr", year - 2))
+                for row in data.get("list", []):
+                    se, knd = row.get("se", ""), row.get("stock_knd") or ""
+                    if se.startswith("주당 현금배당금") and knd.startswith("보통"):
+                        field = "dps"
+                    elif se.startswith("주당액면가액"):
+                        field = "par"
+                    elif se.startswith("(연결)현금배당성향"):
+                        field = "payout"
+                    else:
+                        continue
+                    for col, y in cols:
+                        v = str(row.get(col) or "").strip().replace(",", "")
+                        if field == "dps" and v in ("", "-"):
+                            num = 0.0
+                        else:
+                            try:
+                                num = float(v)
+                            except ValueError:
+                                num = None
+                        history.setdefault(y, {}).setdefault(field, num)
+        _cache_put(ck, {"history": {str(y): v for y, v in history.items()}})
+        return history
+
     # ------------------------------------------------------------------ #
     # 5) 사업의 개요 (정확한 섹션 offset 기반) — RAG용 전체 "사업의 내용"과 별개로
     #    LLM 프롬프트에 바로 제시할 핵심 요약(문단+표)을 만든다.
