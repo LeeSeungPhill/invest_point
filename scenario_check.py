@@ -357,14 +357,11 @@ def _normalize_won_units(text: str) -> str:
 
 
 def find_unverified_numbers(report_sections: dict, trusted_blocks: list,
-                            revenue_scale: Optional[float] = None) -> list:
+                            skip: Optional[set] = None) -> list:
     """[성장 시나리오]/[가치 포지션]/[핵심 이슈]/[투자포인트] 절의 숫자만 검사
     (리스크·공시 등 서술 절의 예시 숫자까지 검사하면 오탐이 늘어난다).
-
-    revenue_scale(직전 분기/연간 매출, 억원)이 주어지면, 미검증 숫자가 그 50배를
-    넘을 때 '단위 오류 의심(백만원을 억원으로 잘못 읽음 등)'을 함께 표시한다 —
-    실제로 발생한 사례(수주잔고 표가 백만원 단위인데 억원으로 인용해 100배
-    부풀려진 경우)를 프롬프트 준수 여부와 무관하게 붙잡기 위함."""
+    skip: 이미 단위 오류로 잡힌 (절, 억원 환산값) — 같은 금액을 두 번 적지 않는다.
+    단위 오류 판정은 find_unit_errors가 따로 한다."""
     trusted = _trusted_numbers(trusted_blocks)
     trusted_floats = []
     for t in trusted:
@@ -394,38 +391,134 @@ def find_unverified_numbers(report_sections: dict, trusted_blocks: list,
                 or abs(val * 10000 - t) <= max(0.05 * abs(val * 10000), 0.5)
                 for t in trusted_floats
             )
-            if not found:
-                tag = f"{tok}({name})"
-                if revenue_scale and abs(val) > revenue_scale * _UNIT_ERROR_RATIO:
-                    tag += " ⚠단위오류의심(백만원→억원 100배 오독 등 확인)"
-                unverified.append(tag)
+            if not found and (name, round(val, 1)) not in (skip or set()):
+                unverified.append(f"{tok}({name})")
     return unverified
 
 
-# [리스크]/[데이터 공백]은 오탐 방지를 위해 일반 미검증 숫자 검사 대상에서 뺐지만
-# (실제 사업보고서 청크의 진짜 숫자를 인용하는 경우가 많음), '회사 매출 규모 대비
-# 비정상적으로 큰 금액'만은 예외적으로 스캔한다 — 실제 사례: DART 원단위 영업손실
-# -1,630,054,490원(=-16.3억원)을 100배 부풀려 [리스크]에 '-1,630억원'으로 오기재.
-_SCALE_CHECK_SECTIONS = ("리스크", "데이터 공백")
+# --- 금액 단위 오류(백만원을 억원으로 읽는 100배 오독 등) ---
+# 실측 사례:
+#   · DART 원단위 영업손실 -1,630,054,490원(=-16.3억원)을 [리스크]에 '-1,630억원'으로 오기재.
+#   · 래블업 0147B0 수주잔고 5,524백만원(=55.24억원)을 '5,524억원'으로 오기재 — 그런데 예전
+#     검사는 숫자가 다른 블록의 숫자와 ±5% 안에서 맞으면 '검증됨'으로 넘기고 단위 오류
+#     표시는 미검증 숫자에만 붙였다. 5,524가 뉴스 제목 '코스피 5600선'과 우연히 맞아 통과.
+#     → 숫자가 어딘가와 맞는지와 상관없이 금액 자체의 규모로 판정한다.
+#   · 같은 리포트에서 '2026년'(연도)·'주가 14,100원'을 억원 기준선과 비교해 오탐 →
+#     단위가 붙은 금액 표현만 억원으로 환산해 본다(원 단위 소액은 환산하면 작아 걸리지 않는다).
+_MONEY_RE = re.compile(
+    r"(?<![\d.,])(?P<jo>\d[\d,]*(?:\.\d+)?)\s*조\s*(?P<jo_eok>\d[\d,]*(?:\.\d+)?)\s*억(?:\s*원)?"
+    r"|(?<![\d.,])(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>조|억|백만|천)(?:\s*원)?"
+    r"|(?<![\d.,])(?P<won>\d[\d,]*(?:\.\d+)?)\s*원")
+_EOK_PER_UNIT = {"조": 10000.0, "억": 1.0, "백만": 0.01, "천": 0.00001}
 
 
-def find_scale_implausible_numbers(report_sections: dict, revenue_scale: Optional[float]) -> list:
-    if not revenue_scale:
-        return []
+def _money_eok(m: re.Match) -> Optional[float]:
+    def f(s):
+        return float(s.replace(",", ""))
+    try:
+        if m.group("jo"):
+            return f(m.group("jo")) * 10000 + f(m.group("jo_eok"))
+        if m.group("num"):
+            return f(m.group("num")) * _EOK_PER_UNIT[m.group("unit")]
+        return f(m.group("won")) / 1e8
+    except ValueError:
+        return None
+
+
+# 회사 금액이 아닌 큰 수치는 규모 판정에서 뺀다(최근 60일 리포트 233건 재검사에서 나온
+# 오탐: '무선충전 시장 2030년 150조원', '세계 국방비 4,042조원', '라이선싱 딜 총 가치
+# 2,502억 달러'). 외화 금액, 그리고 같은 구절 안 금액 바로 앞에 시장 규모를 뜻하는 말이
+# 있는 경우. 회사 금액을 '국내 시장 매출 ...'처럼 적으면 놓칠 수 있지만, 이 검사는 저장 전
+# 금액을 지우는 데 쓰이므로 정상 정보를 지우는 쪽보다 놓치는 쪽을 택한다.
+_FOREIGN_CCY_RE = re.compile(r"\s*(?:달러|USD|US\$|위안|엔|유로)")
+# '글로벌'은 넣지 않는다 — '글로벌 수출 잔고'처럼 회사 금액에도 흔히 붙어(실측: 한화시스템
+# 수출 잔고 113.2조원 환산 오류를 놓침), 시장 규모 표현은 대개 '시장'이 함께 나온다.
+_MARKET_WORDS = ("시장", "세계", "국방비", "업계", "산업 규모")
+_CLAUSE_BREAK_RE = re.compile(r"[.·;\]\n]")
+
+
+def _is_non_company_amount(text: str, m: re.Match) -> bool:
+    if _FOREIGN_CCY_RE.match(text, m.end()):
+        return True
+    before = text[max(0, m.start() - 40):m.start()]
+    clause = _CLAUSE_BREAK_RE.split(before)[-1]
+    return any(w in clause for w in _MARKET_WORDS)
+
+
+# 'X억원(Y원)'처럼 환산값 뒤 괄호에 원문 단위 값을 함께 적은 경우는 둘을 직접 비교한다 —
+# 규모 기준(매출의 50배)으로는 10배 오류를 못 잡는다(실측: 큐리옥스바이오시스템즈
+# '매출 515억원(5,151,548,437원)' — 괄호 값은 51.5억원). 괄호 앞머리의 '원문 '·'약 ' 같은
+# 짧은 말은 허용한다. 반올림 차이는 _PAIR_TOL(5%, 최소 0.5억원)까지 같은 값으로 본다.
+_PAIR_OPEN_RE = re.compile(r"\s*\(\s*[^\d()\[\]]{0,10}")
+_PAIR_CLOSE_RE = re.compile(r"\s*\)")
+_PAIR_TOL = 0.05
+_CONVERTED_UNITS = ("억", "조")
+
+
+def _is_converted(m: re.Match) -> bool:
+    """억·조로 적힌 금액(LLM이 환산한 쪽). 원·백만원·천원은 청크 원문 단위 그대로인 쪽."""
+    return bool(m.group("jo")) or (m.group("unit") in _CONVERTED_UNITS)
+
+
+def _pair_mismatches(text: str) -> list:
+    """'A(B)' 금액 쌍 중 억원 환산값이 어긋나는 것: [(틀린 쪽 match, a_eok, b_eok)].
+    두 쪽 모두 억·조이거나 모두 원문 단위면 어느 쪽이 틀렸는지 알 수 없어 건너뛴다."""
+    ms = list(_MONEY_RE.finditer(text or ""))
     out = []
-    for name in _SCALE_CHECK_SECTIONS:
-        text = _normalize_won_units(_merge_jo_eok(report_sections.get(name, "")))
-        for m in _NUM.finditer(text):
-            tok = m.group().replace(",", "").replace(" ", "").rstrip("%")
-            if not tok or _is_noise(tok):
-                continue
-            try:
-                val = float(tok)
-            except ValueError:
-                continue
-            if abs(val) > revenue_scale * _UNIT_ERROR_RATIO:
-                out.append(f"{tok}({name}) ⚠단위오류의심(회사 매출 규모 대비 비정상적으로 큼)")
+    for a, b in zip(ms, ms[1:]):
+        if not (_PAIR_OPEN_RE.fullmatch(text[a.end():b.start()]) and _PAIR_CLOSE_RE.match(text, b.end())):
+            continue
+        if _is_converted(a) == _is_converted(b):
+            continue
+        ea, eb = _money_eok(a), _money_eok(b)
+        if ea is None or eb is None:
+            continue
+        if abs(ea - eb) > max(_PAIR_TOL * max(abs(ea), abs(eb)), 0.5):
+            out.append((a if _is_converted(a) else b, ea, eb))
     return out
+
+
+def find_unit_errors(report_sections: dict, revenue_scale: Optional[float]) -> list:
+    """원화 금액 단위 오류 두 가지. 반환: [{section, raw(원문 표기), eok, reason}] — raw는
+    redact_unit_errors가 저장 전 원문에서 지우는 데 쓴다.
+      1) 'X억원(Y원)' 같은 쌍에서 환산값과 괄호 원문 값이 어긋남(매출 규모와 무관하게 판정).
+      2) 억원 환산값이 직전 실적 매출(revenue_scale, 억원)의 _UNIT_ERROR_RATIO배 초과
+         (외화·시장 규모 수치는 제외)."""
+    out, seen = [], set()
+    limit = abs(revenue_scale) * _UNIT_ERROR_RATIO if revenue_scale else None
+    for name, text in report_sections.items():
+        text = text or ""
+        for m, ea, eb in _pair_mismatches(text):
+            seen.add((name, m.start()))
+            out.append({"section": name, "raw": m.group(0).strip(), "eok": _money_eok(m),
+                        "reason": f"괄호 안 원문 값과 불일치({ea:,.2f}억원 vs {eb:,.2f}억원)"})
+        if limit is None:
+            continue
+        for m in _MONEY_RE.finditer(text):
+            if (name, m.start()) in seen:
+                continue
+            eok = _money_eok(m)
+            if eok is None or abs(eok) <= limit or _is_non_company_amount(text, m):
+                continue
+            out.append({"section": name, "raw": m.group(0).strip(), "eok": eok,
+                        "reason": f"직전 실적 매출 {revenue_scale:g}억원의 {_UNIT_ERROR_RATIO:g}배 초과"})
+    return out
+
+
+REDACTED_AMOUNT = "(금액 확인 필요)"
+
+
+def redact_unit_errors(report: str, unit_errors: list) -> tuple[str, list]:
+    """단위 오류로 잡힌 금액 표기를 리포트에서 지우고 REDACTED_AMOUNT로 바꾼다(사용자
+    확정: 경고가 남은 숫자는 저장 전에 지운다). 숫자만 빼면 '수주잔고 (구독 )'처럼
+    문장이 깨지고 단위만 남아 오해를 살 수 있어 표시로 대체한다. 다른 숫자의 일부를
+    건드리지 않도록 앞에 숫자가 붙어 있으면 바꾸지 않는다(예: '15,524억원' 속 '5,524억원')."""
+    removed = []
+    for raw in sorted({e["raw"] for e in unit_errors or []}, key=len, reverse=True):
+        report, n = re.subn(rf"(?<![\d.,]){re.escape(raw)}", REDACTED_AMOUNT, report)
+        if n:
+            removed.append(raw)
+    return report, removed
 
 
 def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
@@ -441,8 +534,11 @@ def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
     band_chk = check_band_threshold(sections, valuation)
     headline_chk = check_headline_direction(sections, growth)
     revenue_scale = (growth.get("latest") or {}).get("revenue")
-    unverified = (find_unverified_numbers(sections, trusted_blocks, revenue_scale)
-                 + find_scale_implausible_numbers(sections, revenue_scale))
+    unit_errors = find_unit_errors(sections, revenue_scale)
+    unverified = (
+        [f"{e['raw']}({e['section']}) ⚠단위오류의심({e['reason']})" for e in unit_errors]
+        + find_unverified_numbers(sections, trusted_blocks,
+                                  skip={(e["section"], round(e["eok"], 1)) for e in unit_errors}))
 
     problems = []
     # 완전성 문제는 다른 모든 체크보다 먼저 본다 — 응답이 중간에 끊긴 경우
@@ -471,6 +567,7 @@ def check(report: str, invest_point: dict, trusted_blocks: list) -> dict:
         "band_check": band_chk,
         "headline_check": headline_chk,
         "unverified_numbers": unverified,
+        "unit_errors": unit_errors,
         "problems": problems,
         "consistent": consistent,
         "verdict": "✅ 시나리오 일관" if consistent else ("⚠️ 불일치: " + "; ".join(problems)),

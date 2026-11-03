@@ -72,6 +72,7 @@ from invest_point import build_invest_point as build_invest_point_calc
 from invest_point import format_invest_point_block
 from invest_point import build_growth_signal
 from invest_point import explain_quality_signal
+from invest_point import MIN_LISTED_YEARS_FOR_BAND
 from cross_check import run_cross_check, format_cross_check_block
 from scenario_check import SECTION_TAGS
 from industry_category import classify_industry
@@ -122,6 +123,7 @@ class AnalysisState(TypedDict, total=False):
     value_investment: str       # 5단계: quality_signal True인 종목만 — 가치주 점검 결과
     watchlist: dict             # 트레이딩 계획서 관심종목 편입 판정(watchlist_screen.py)
     dividend: dict              # TTM/실효 DPS·배당 안정성 점수(dividend_metrics.py)
+    redacted_amounts: list      # 저장 전 리포트에서 지운 단위 오류 의심 금액 표기
     rag_skip: bool              # Ollama 헬스체크 실패 시 이번 실행 임베딩 검색 생략(run에서 주입)
     llm_error: str              # analyze 단계(import/init/llm) 에러 메시지를 최상위로 노출
     # 병렬 노드들이 같은 superstep에서 동시에 쓰므로 reducer 지정
@@ -163,12 +165,43 @@ def resolve_corp(state: AnalysisState) -> AnalysisState:
         return {"errors": _append_error(state, "resolve_corp", e)}
 
 
+def _registration_business(corp_code: str):
+    """정기보고서가 아직 없는 신규상장사: 최근 증권신고서(지분증권)·투자설명서의
+    '사업의 내용'을 대신 쓴다. 최신 것부터 최대 3건 시도해 본문이 나오는 첫 건."""
+    for filing in _dart.registration_statements(corp_code)[:3]:
+        try:
+            text = _dart.fetch_business_section(filing.rcept_no)
+        except DartError:
+            continue
+        if text:
+            return filing, text
+    return None, ""
+
+
 def fetch_business(state: AnalysisState) -> AnalysisState:
-    """최신 정기보고서를 찾아 '사업의 내용' 본문을 추출."""
+    """최신 정기보고서를 찾아 '사업의 내용' 본문을 추출. 정기보고서가 없으면(상장 후
+    첫 분기·반기보고서 전의 신규상장사) 증권신고서·투자설명서의 같은 장으로 대체한다."""
     if not state.get("corp_code"):
         return {"sources_status": {"dart_business": "skip"}}
     try:
         filing = _dart.latest_periodic_report(state["corp_code"])
+    except DartError as e:
+        try:
+            filing, text = _registration_business(state["corp_code"])
+        except DartError:
+            filing, text = None, ""
+        if filing is None:
+            return {"errors": _append_error(state, "fetch_business", e),
+                    "sources_status": {"dart_business": "error"}}
+        log.info("정기보고서 없음(%s) — %s(%s)로 대체", state.get("stock_code"),
+                 filing.report_nm, filing.rcept_dt)
+        return {
+            "report_nm": f"{filing.report_nm} (신규상장, 정기보고서 대체)",
+            "rcept_dt": filing.rcept_dt,
+            "business_text": text,
+            "sources_status": {"dart_business": "ok"},
+        }
+    try:
         text = _dart.fetch_business_section(filing.rcept_no)
         if not text:
             raise DartError("사업의 내용 섹션을 찾지 못했습니다(문서 구조 상이 가능).")
@@ -189,7 +222,15 @@ def fetch_financials(state: AnalysisState) -> AnalysisState:
         return {"sources_status": {"dart_financials": "skip"}}
     try:
         # fetch_business와 동일한 우선순위(분기→반기→사업)로 고른 보고서 기준
-        filing = _dart.latest_periodic_report(state["corp_code"])
+        try:
+            filing = _dart.latest_periodic_report(state["corp_code"])
+        except DartError:
+            # DART 재무 API(fnlttSinglAcnt)는 정기보고서 기준이라 정기보고서가 없는
+            # 신규상장사는 조회할 것이 없다 — 오류가 아니라 '해당 없음'으로 남긴다.
+            if _dart.registration_statements(state["corp_code"]):
+                log.info("신규상장(정기보고서 없음, %s) — DART 재무 생략", state.get("stock_code"))
+                return {"sources_status": {"dart_financials": "skip"}}
+            raise
         fs = _dart.financial_series(state["corp_code"], filing.bsns_year, filing.reprt_code)
         # 해당 보고서에서 매출이 비면 직전 사업보고서(연간)로 폴백
         if not fs.revenue:
@@ -270,6 +311,14 @@ def fetch_price(state: AnalysisState) -> AnalysisState:
             price.update(fetch_listing_age(state["stock_code"]))
         except Exception as e:  # noqa: BLE001  (보조 정보라 실패해도 price 자체는 유효)
             log.warning("상장일 조회 실패(%s): %s", state["stock_code"], e)
+        # 상장 1년 미만이면 52주 시세 이력이 모자라 밴드 위치·고점 대비 하락률이 의미가
+        # 없다 — 밴드 판정을 전부 '확인 불가'로 돌린다(사용자 확정). 52주 최고/최저 원값은
+        # 소스 간 교차검증(cross_check)용으로 남긴다. 상장일을 못 구한 경우(None)는 판단
+        # 근거가 없으므로 기존대로 둔다.
+        years = price.get("years_listed")
+        if years is not None and years < MIN_LISTED_YEARS_FOR_BAND:
+            price["band_position"] = None
+            price["band_unavailable"] = f"상장 {years}년, {MIN_LISTED_YEARS_FOR_BAND:g}년 미만"
         try:
             import invest_mng_lookup
             high_price = invest_mng_lookup.fetch_high_price(state["stock_code"])
@@ -303,6 +352,16 @@ def fetch_financial_history(state: AnalysisState) -> AnalysisState:
         except DartError as e:
             last_err = e
             continue
+    # 정기보고서가 하나도 없고 증권신고서만 있는 신규상장사는 오류가 아니라 '해당 없음'
+    # (유상증자로 증권신고서를 낸 일반 기업의 진짜 오류를 가리지 않도록 둘 다 본다).
+    try:
+        _dart.latest_periodic_report(state["corp_code"])
+    except DartError:
+        try:
+            if _dart.registration_statements(state["corp_code"]):
+                return {"sources_status": {"financial_history": "skip"}}
+        except DartError:
+            pass
     return {"errors": _append_error(state, "fetch_financial_history",
                                     last_err or DartError("연간 사업보고서 재무 데이터 없음")),
             "sources_status": {"financial_history": "error"}}
@@ -588,6 +647,7 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
         exclusions = ws.evaluate_exclusions(code, warnings, dilution)
 
     result = ws.finalize(matched, dd, checklist, exclusions, unknown)
+    result["drawdown_note"] = price.get("band_unavailable")
     if not result["eligible"]:
         log.info("관심종목 편입 미해당(%s/%s): %s", code, name, ws.explain(result))
         return {"watchlist": result}
@@ -660,8 +720,18 @@ def _extract_report_section(report: str, tag: str) -> str:
 def build_investment_summary(state: AnalysisState) -> AnalysisState:
     """4단계: 3단계 검증까지 끝난 LLM 리포트에서 [핵심 이슈]/[투자포인트]/[리스크]
     절만 뽑아 investment_summary로 남긴다(사용자 확정 — 이 3개 절만). 여기서는
-    새 숫자를 만들지 않고 이미 검증된 리포트 문장만 재구성한다(추가 LLM 호출 없음)."""
-    report = state.get("report") or ""
+    새 숫자를 만들지 않고 이미 검증된 리포트 문장만 재구성한다(추가 LLM 호출 없음).
+
+    그 전에, 마지막 시나리오 검증(재생성했다면 재생성 후 검증)에서 단위 오류로 남은
+    금액을 리포트에서 지운다(사용자 확정 — 경고가 남은 숫자를 저장 전에 지움). 이
+    노드가 리포트를 다시 내보내므로 analysis_history.report·investment_summary와 그걸
+    읽는 invest_mng.invest_issue 등에 지운 결과가 들어간다."""
+    import scenario_check
+    unit_errors = (state.get("scenario_consistency") or {}).get("unit_errors") or []
+    report, removed = scenario_check.redact_unit_errors(state.get("report") or "", unit_errors)
+    if removed:
+        log.info("단위 오류 의심 금액 %d건을 리포트에서 삭제(%s/%s): %s", len(removed),
+                 state.get("stock_code"), state.get("corp_name"), ", ".join(removed))
 
     lines = []
     for tag in ("핵심 이슈", "투자포인트", "리스크"):
@@ -676,7 +746,8 @@ def build_investment_summary(state: AnalysisState) -> AnalysisState:
     if not report or report.strip().startswith("("):
         lines.append(f"(리포트 미생성: {report or '리포트 없음'})")
 
-    return {"investment_summary": "\n\n".join(lines)}
+    return {"investment_summary": "\n\n".join(lines), "report": report,
+            "redacted_amounts": removed}
 
 
 # 사업의 내용에서 뽑을 관점들 (각 질의로 관련 청크를 검색)
@@ -863,7 +934,9 @@ def _build_prompt_blocks(state: AnalysisState) -> dict:
     if price.get("price") is not None:
         price_block = (
             f"- 현재가: {price.get('price'):,.0f}원 (전일대비 {price.get('change_pct')}%)\n"
-            f"- 52주 밴드: {price.get('low_52w'):,.0f} ~ {price.get('high_52w'):,.0f}원\n"
+            + (f"- 52주 밴드: 판정 제외({price['band_unavailable']} — 52주 시세 이력 부족)\n"
+               if price.get("band_unavailable") else
+               f"- 52주 밴드: {price.get('low_52w'):,.0f} ~ {price.get('high_52w'):,.0f}원\n") +
             f"- PER: {price.get('per')} / PBR: {price.get('pbr')} / "
             f"추정PER: {price.get('cns_per')}\n"
             f"- 컨센서스 목표주가: {price.get('target_price_mean')}"
@@ -1364,6 +1437,8 @@ if __name__ == "__main__":
                   f"리포트 절: {sc['signal_check']['section'][:80]}")
         if sc.get("unverified_numbers"):
             print(f"   - 미검증 파생수치: {sc['unverified_numbers'][:5]}")
+        if result.get("redacted_amounts"):
+            print(f"   - 저장 전 리포트에서 삭제한 단위 오류 의심 금액: {result['redacted_amounts']}")
 
     dv = result.get("dividend")
     if dv:

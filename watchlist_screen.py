@@ -47,7 +47,10 @@ TYPE_LABELS = {
 
 
 def drawdown_pct(price: Optional[dict]) -> Optional[float]:
-    """현재가의 52주 고점 대비 등락률(%). 음수가 하락."""
+    """현재가의 52주 고점 대비 등락률(%). 음수가 하락. 상장 1년 미만(price의
+    band_unavailable 표시)이면 52주 고점이 의미가 없어 None(확인 불가)."""
+    if (price or {}).get("band_unavailable"):
+        return None
     p, h = (price or {}).get("price"), (price or {}).get("high_52w")
     if not p or not h:
         return None
@@ -220,7 +223,7 @@ def explain(result: dict) -> str:
         return ""
     dd = result.get("drawdown_pct")
     if dd is None:
-        return "52주 고점 대비 하락률 계산 불가(시세 없음)"
+        return f"52주 고점 대비 하락률 확인 불가({result.get('drawdown_note') or '시세 없음'})"
     if dd > DRAWDOWN_THRESHOLD_PCT:
         return f"52주 고점 대비 {dd}% (기준 {DRAWDOWN_THRESHOLD_PCT:.0f}% 이하 미달)"
     if not result.get("matched"):

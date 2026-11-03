@@ -360,31 +360,48 @@ def fetch_naver_price(stock_code: str, *, cache_ttl: int = 600) -> dict:
 #   실측 경로다. Batch/fnguidePerformbot.py가 종목코드 매핑을 만들 때 쓰는
 #   것과 동일한 다운로드 URL(개인 리서치 목적, 상업적 재배포 아님).
 # ---------------------------------------------------------------------- #
-def fetch_listing_age(stock_code: str, *, cache_ttl: int = 7 * 86400) -> dict:
-    """상장일과 상장 후 경과년수. 상장일은 사실상 불변인 정적 데이터라 전체
-    상장사 목록(2700여개)을 통째로 캐시해 재사용한다(종목별 개별 다운로드가
-    아니라 프로세스 전체에서 사실상 한 번만 받는다). 조회 실패/미상장 종목이면
-    빈 dict를 반환한다(다른 fetch_* 함수와 달리 예외를 던지지 않음 — 이 값은
-    가치 시그널의 보조 조건 중 하나일 뿐 가격 데이터 자체를 막을 이유가 없다)."""
-    cached = _cache_get("krx_listed_dates", cache_ttl)
-    if cached is None:
+_KRX_LISTING_TTL = 86400
+_KRX_MISS_RELOAD_SEC = 600
+_krx_miss_reloaded_at = 0.0
+
+
+def krx_listing(stock_code: Optional[str] = None) -> dict:
+    """KRX 상장법인목록 {종목코드: {name, listed_date}}. 하루 캐시하되, stock_code가
+    주어졌는데 목록에 없으면(오늘 상장한 종목 등) 10분에 1회까지 다시 받는다.
+    다시 받다가 실패하면 기존 캐시를 쓰고, 캐시도 없으면 빈 dict(예외 없음)."""
+    global _krx_miss_reloaded_at
+    table = _cache_get("krx_listing_v2", _KRX_LISTING_TTL)
+    code = stock_code.zfill(6) if stock_code else None
+    miss = (table is not None and code is not None and code not in table
+            and time.time() - _krx_miss_reloaded_at > _KRX_MISS_RELOAD_SEC)
+    if table is None or miss:
+        if miss:
+            _krx_miss_reloaded_at = time.time()
         try:
             r = _request("GET", "http://kind.krx.co.kr/corpgeneral/corpList.do",
                          params={"method": "download"}, timeout=20)
             r.encoding = "EUC-KR"
             import pandas as pd
             from io import StringIO
-            df = pd.read_html(StringIO(r.text), header=0)[0]
+            df = pd.read_html(StringIO(r.text), header=0, converters={"종목코드": str})[0]
             df.columns = ["name", "market", "code", "industry", "product",
                           "listed_date", "settle_month", "ceo", "homepage", "region"]
-            df["code"] = df["code"].astype(str).str.zfill(6)
-            cached = dict(zip(df["code"], df["listed_date"].astype(str)))
-            _cache_put("krx_listed_dates", cached)
+            df["code"] = df["code"].astype(str).str.strip().str.zfill(6)
+            table = {c: {"name": str(n).strip(), "listed_date": str(d)}
+                     for c, n, d in zip(df["code"], df["name"], df["listed_date"])}
+            _cache_put("krx_listing_v2", table)
         except Exception as e:  # noqa: BLE001
             logger.warning("KRX 상장법인목록 조회 실패: %s", e)
-            return {}
+            if table is None:
+                return {}
+    return table
 
-    listed_date = cached.get(stock_code.zfill(6))
+
+def fetch_listing_age(stock_code: str) -> dict:
+    """상장일과 상장 후 경과년수(krx_listing 기반). 조회 실패/미상장 종목이면 빈
+    dict를 반환한다(다른 fetch_* 함수와 달리 예외를 던지지 않음 — 이 값은 가치
+    시그널의 보조 조건 중 하나일 뿐 가격 데이터 자체를 막을 이유가 없다)."""
+    listed_date = (krx_listing(stock_code).get(stock_code.zfill(6)) or {}).get("listed_date")
     if not listed_date:
         return {}
     try:

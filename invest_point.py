@@ -26,6 +26,10 @@ from __future__ import annotations
 from typing import Optional
 
 LOW_BAND_THRESHOLD = 0.4  # 52주 밴드 하위 40% 이내를 '하단'으로 본다
+# 상장 후 이 기간(년)이 안 된 종목은 52주 시세 이력이 모자라 밴드 위치·고점 대비
+# 하락률이 의미가 없다(실측: 래블업 0147B0 상장 당일 '밴드위치 5.7%로 하단 충족').
+# mvp_graph.fetch_price가 price['band_unavailable']로 표시하고 밴드 판정은 '확인 불가'.
+MIN_LISTED_YEARS_FOR_BAND = 1.0
 
 SCORE_MAX = 100          # stability_score.py가 재사용(실적/재무안정성 점수 스케일)
 REVENUE_WEIGHT = 0.7     # stability_score.py가 재사용(변동계수 가중평균 시 매출 가중치)
@@ -214,12 +218,15 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
     op_yoy_forward = growth.get("op_yoy_forward")
 
     if band_pos is None:
-        notes.append("52주 밴드 계산 불가(시세 데이터 부족) — 자료상 확인 불가")
+        reason = (price or {}).get("band_unavailable") or "시세 데이터 부족"
+        notes.append(f"52주 밴드 계산 불가({reason}) — 자료상 확인 불가")
     if op_yoy_forward is None:
         notes.append("예상실적 방향 불명 — 자료상 확인 불가")
 
     est_rising = op_yoy_forward is not None and op_yoy_forward > 0
-    is_low_band = band_pos is not None and band_pos <= LOW_BAND_THRESHOLD
+    # 밴드를 알 수 없으면 None(미충족이 아니라 판정 불가) — scenario_check.check_band_threshold가
+    # None이면 밴드 서술 검증을 건너뛴다.
+    is_low_band = None if band_pos is None else band_pos <= LOW_BAND_THRESHOLD
     signal = bool(est_rising and is_low_band)
 
     target_upside_pct = price.get("target_upside_pct") if price else None
@@ -242,6 +249,7 @@ def build_value_signal(price: dict, growth: dict, annual_highlight: Optional[lis
 
     return {
         "band_position": band_pos,
+        "band_unavailable": (price or {}).get("band_unavailable"),
         "low_band_threshold": LOW_BAND_THRESHOLD,
         "est_rising": est_rising,
         "is_low_band": is_low_band,
@@ -335,7 +343,8 @@ def format_invest_point_block(ip: dict) -> str:
         lines.append(f"- 52주 밴드 내 위치: {v['band_position']*100:.1f}% "
                      f"(0%=52주최저, 100%=52주최고, 하단 기준 {v['low_band_threshold']*100:.0f}% 이하)")
     else:
-        lines.append("- 52주 밴드 내 위치: 자료상 확인 불가")
+        why = f"({v['band_unavailable']})" if v.get("band_unavailable") else ""
+        lines.append(f"- 52주 밴드 내 위치: 자료상 확인 불가{why}")
     if v["target_upside_pct"] is not None:
         lines.append(f"- 컨센서스 목표주가 대비 상승여력: {v['target_upside_pct']}%")
     lines.append(f"- 가치 시그널(예상실적 상승 & 주가 하단 동시 충족): "

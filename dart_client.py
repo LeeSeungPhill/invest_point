@@ -43,6 +43,10 @@ BASE = "https://opendart.fss.or.kr/api"
 CACHE_DIR = Path(os.getenv("DART_CACHE_DIR", Path.home() / ".cache" / "dart_mvp"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# resolve()가 종목코드를 못 찾아 corpCode.xml을 강제로 다시 받은 마지막 시각(프로세스
+# 공통). 배치에서 상장폐지 종목 등으로 계속 못 찾을 때 매번 수 MB를 받지 않도록 제한.
+_CORP_MAP_FORCED_AT = 0.0
+
 # dart.fss.or.kr(웹사이트, OpenDART API와 별개) 접근용 헤더
 _NAVI_HDR = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -143,18 +147,27 @@ class DartClient:
     # ------------------------------------------------------------------ #
     # 1) 종목코드 -> 고유번호(corp_code)
     # ------------------------------------------------------------------ #
-    def _load_corp_map(self) -> dict:
-        """corpCode.xml(전체 기업 매핑)을 받아 stock_code -> (corp_code, corp_name) 캐시."""
-        if self._corp_map is not None:
+    def _load_corp_map(self, force: bool = False) -> dict:
+        """corpCode.xml(전체 기업 매핑)을 받아 stock_code -> (corp_code, corp_name) 캐시.
+        종목코드가 빈 회사(비상장 — 상장 당일엔 신규상장사도 여기 있음)는 회사명 ->
+        [corp_code] 색인(self._unlisted, corp_unlisted.tsv)으로 따로 둔다. force=True면
+        7일 캐시를 무시하고 새로 받는다."""
+        if self._corp_map is not None and not force:
             return self._corp_map
 
         cache_file = CACHE_DIR / "corp_map.tsv"
-        # 캐시가 7일 이내면 재사용
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 7 * 86400:
+        unlisted_file = CACHE_DIR / "corp_unlisted.tsv"
+        # 캐시가 7일 이내면 재사용(비상장 색인이 없는 예전 캐시면 새로 받는다)
+        if (not force and cache_file.exists() and unlisted_file.exists()
+                and (time.time() - cache_file.stat().st_mtime) < 7 * 86400):
             self._corp_map = {}
             for line in cache_file.read_text(encoding="utf-8").splitlines():
                 stock, code, name = line.split("\t")
                 self._corp_map[stock] = (code, name)
+            self._unlisted = {}
+            for line in unlisted_file.read_text(encoding="utf-8").splitlines():
+                name, code = line.split("\t")
+                self._unlisted.setdefault(name, []).append(code)
             logger.info("corp_map 캐시 로드 (%d건)", len(self._corp_map))
             return self._corp_map
 
@@ -165,31 +178,101 @@ class DartClient:
         xml_text = xml_bytes.decode("utf-8")
 
         mapping: dict = {}
+        unlisted: dict = {}
         # <list><corp_code>..</corp_code><corp_name>..</corp_name><stock_code>..</stock_code>..
         for m in re.finditer(r"<list>(.*?)</list>", xml_text, re.S):
             block = m.group(1)
             stock = _tag(block, "stock_code").strip()
-            if not stock:           # 비상장은 종목코드가 비어있음 -> 스킵
-                continue
             code = _tag(block, "corp_code").strip()
             name = _tag(block, "corp_name").strip()
-            mapping[stock] = (code, name)
+            if stock:
+                mapping[stock] = (code, name)
+            else:
+                unlisted.setdefault(name, []).append(code)
 
         cache_file.write_text(
             "\n".join(f"{s}\t{c}\t{n}" for s, (c, n) in mapping.items()),
             encoding="utf-8",
         )
-        self._corp_map = mapping
-        logger.info("corp_map 생성 (%d건)", len(mapping))
+        unlisted_file.write_text(
+            "\n".join(f"{n}\t{c}" for n, codes in unlisted.items() for c in codes),
+            encoding="utf-8",
+        )
+        self._corp_map, self._unlisted = mapping, unlisted
+        logger.info("corp_map 생성 (%d건, 비상장 %d건)", len(mapping), len(unlisted))
         return mapping
 
     def resolve(self, stock_code: str) -> tuple[str, str]:
-        """'005930' -> ('00126380', '삼성전자')"""
+        """'005930' -> ('00126380', '삼성전자'). 목록에 없으면 신규상장사일 수 있어
+        두 단계로 더 찾는다(실측 2026-11-03):
+          1) 캐시가 상장 전 것 — DART 목록을 즉시 다시 받는다(영광 359410: 11/2 상장,
+             11/2 오전 캐시엔 없고 새 목록엔 있음). 재다운로드는 10분에 1회까지.
+          2) DART가 아직 종목코드를 안 채운 상장 당일 — KRX 상장법인목록에서 회사명을
+             얻어 종목코드가 빈 DART 회사 중 같은 이름을 찾는다(래블업 0147B0: 11/3 상장,
+             DART엔 고유번호 01956751만 있고 종목코드 빈칸)."""
+        global _CORP_MAP_FORCED_AT
         stock_code = stock_code.zfill(6)
         m = self._load_corp_map()
-        if stock_code not in m:
-            raise DartError(f"종목코드 {stock_code} 에 해당하는 고유번호를 찾지 못했습니다.")
-        return m[stock_code]
+        if stock_code in m:
+            return m[stock_code]
+        if time.time() - _CORP_MAP_FORCED_AT > 600:
+            _CORP_MAP_FORCED_AT = time.time()
+            m = self._load_corp_map(force=True)
+            if stock_code in m:
+                return m[stock_code]
+        hit = self._resolve_by_krx_name(stock_code)
+        if hit:
+            self._corp_map[stock_code] = hit
+            return hit
+        raise DartError(f"종목코드 {stock_code} 에 해당하는 고유번호를 찾지 못했습니다.")
+
+    def _resolve_by_krx_name(self, stock_code: str) -> Optional[tuple[str, str]]:
+        """KRX 회사명으로 종목코드가 빈 DART 회사를 찾는다. 같은 이름의 비상장 회사가
+        여럿이면(실측: '영광' 3곳, '이스트엔드'·'디티에스'·'엘리스' 2곳씩) 최근 1년 안에
+        증권신고서(지분증권)·투자설명서를 낸 회사(=공모 상장한 회사)로 좁히고, 그래도
+        하나로 안 좁혀지면 엉뚱한 회사를 고르지 않도록 None."""
+        from external_sources import krx_listing
+        info = krx_listing(stock_code).get(stock_code)
+        name = (info or {}).get("name")
+        if not name:
+            return None
+        candidates = getattr(self, "_unlisted", {}).get(name, [])
+        if len(candidates) > 1:
+            candidates = [c for c in candidates if self.registration_statements(c, lookback_days=365)]
+        if len(candidates) != 1:
+            logger.warning("신규상장 고유번호 매칭 실패(%s %s): 후보 %d건", stock_code, name, len(candidates))
+            return None
+        logger.info("신규상장 고유번호 매칭(%s %s → %s, KRX 회사명 기준)", stock_code, name, candidates[0])
+        return candidates[0], name
+
+    def registration_statements(self, corp_code: str, *, lookback_days: int = 540) -> list:
+        """증권신고서(지분증권)·투자설명서(최신순 Filing 목록). 정기보고서가 아직 없는
+        신규상장사의 '사업의 내용' 대체 근거로 쓴다(같은 '사업의 내용' 장이 들어 있음 —
+        실측: 래블업 34,302자, 영광 57,775자). '[발행조건확정]' 정정본과 '[첨부정정]'은
+        본문 없이 바뀐 부분만 담겨 있어(실측 0자) 뺀다."""
+        memo = self.__dict__.setdefault("_registration_memo", {})
+        if (corp_code, lookback_days) in memo:
+            return memo[(corp_code, lookback_days)]
+        end = time.strftime("%Y%m%d")
+        bgn = time.strftime("%Y%m%d", time.localtime(time.time() - lookback_days * 86400))
+        data = self._get("list.json", corp_code=corp_code, bgn_de=bgn, end_de=end,
+                         pblntf_ty="C", page_count=100).json()
+        if data.get("status") == "013":
+            memo[(corp_code, lookback_days)] = []
+            return []
+        self._check_json_status(data, "list.json(registration)")
+        out = []
+        for item in data.get("list", []):  # 최신순
+            nm = item.get("report_nm", "")
+            if not ("투자설명서" in nm or "증권신고서(지분증권)" in nm):
+                continue
+            if "발행조건확정" in nm or "첨부정정" in nm:
+                continue
+            out.append(Filing(corp_code=corp_code, corp_name=item.get("corp_name", ""),
+                              rcept_no=item["rcept_no"], report_nm=nm.strip(),
+                              rcept_dt=item.get("rcept_dt", ""), reprt_code="", bsns_year=""))
+        memo[(corp_code, lookback_days)] = out
+        return out
 
     # ------------------------------------------------------------------ #
     # 2) 최신 정기보고서 찾기 (분기 -> 반기 -> 사업 우선순위)
