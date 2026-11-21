@@ -657,16 +657,32 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
     new_types = [t for t in result["types"] if t not in prev_types]
     log.info("관심종목 편입(%s/%s): %s (신규 %s)", code, name, ",".join(result["types"]),
              ",".join(new_types) or "없음")
-    if new_types:
-        # 이미 관심종목(interestItem_interest_item)으로 등록된 종목은 알릴 필요가
-        # 없다(사용자 요청). 조회 실패(None)도 '미등록'으로 단정할 수 없어 보내지 않는다.
-        import invest_mng_lookup
-        registered = invest_mng_lookup.is_registered_interest_item(code)
-        if registered is False:
-            telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+
+    # 관심종목(interestItem_interest_item) 처리(사용자 확정):
+    #   - 이미 등록됨: watch_type이 이번 편입 유형과 다르면 바꾼다(알림은 보내지 않음).
+    #   - 미등록: 등록은 하지 않고(가격 6개가 필요해 사람이 화면에서 등록), 새로 편입된
+    #     유형이 있을 때 지금처럼 텔레그램으로 알린다.
+    #   - 조회 실패: '미등록'으로 단정할 수 없어 알림도 변경도 하지 않는다.
+    import invest_mng_lookup
+    types_str = invest_mng_lookup.normalize_watch_type(result["types"])
+    registered, cur_watch_type = invest_mng_lookup.interest_item_watch_type(code)
+    if registered is True:
+        if invest_mng_lookup.normalize_watch_type(cur_watch_type) != types_str:
+            try:
+                n = invest_mng_lookup.update_interest_watch_type(code, types_str)
+                log.info("관심종목 관심유형 변경(%s/%s): %s → %s (%d행)", code, name,
+                         cur_watch_type or "없음", types_str, n)
+                result["watch_type_changed"] = {"from": cur_watch_type, "to": types_str}
+            except Exception as e:  # noqa: BLE001
+                log.warning("관심종목 관심유형 변경 실패(%s): %s", code, e)
         else:
-            log.info("관심종목 편입 알림 생략(%s/%s): %s", code, name,
-                     "이미 관심종목에 등록됨" if registered else "관심종목 등록 여부 조회 실패")
+            log.info("관심종목 편입 알림 생략(%s/%s): 이미 관심종목에 등록됨(관심유형 %s 동일)",
+                     code, name, types_str)
+    elif registered is False:
+        if new_types:
+            telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+    else:
+        log.info("관심종목 편입 알림·관심유형 변경 생략(%s/%s): 관심종목 조회 실패", code, name)
     return {"watchlist": result}
 
 

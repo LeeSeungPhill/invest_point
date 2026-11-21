@@ -11,6 +11,11 @@ invest_mng은 이 프로젝트가 만든 테이블이 아니다(weekly_batch.py�
 외부 도구(simul/dly_invest_mng_save.py)가 채운다). 그래서 여기서는 읽기만
 하고 스키마는 건드리지 않는다(ALTER/CREATE 없음).
 
+관심종목(interestItem_interest_item)도 다른 도구(simul_server 등록 화면, reservebot)가
+관리하는 테이블이다. 여기서는 등록 여부·관심유형 조회와, 이미 등록된 종목의 관심유형
+(watch_type) 변경만 한다 — 새 행 등록은 하지 않는다(사용자 확정: 등록에는 저항·지지가
+등 가격 6개가 필요하고 매매 봇들이 그 값을 읽으므로 사람이 화면에서 등록).
+
 접속정보(.env)는 analysis_history.py/weekly_batch.py와 동일한 PG_HOST 등을
 그대로 쓴다(같은 DB, fund_risk_mng). DISABLE_INVEST_MNG_LOOKUP=1로 조회를
 끌 수 있다(DB 접속 불가 환경 대비).
@@ -71,27 +76,53 @@ def fetch_high_price(stock_code: str) -> Optional[float]:
         return None
 
 
-def is_registered_interest_item(stock_code: str, *, nick_name: str = "phills75") -> Optional[bool]:
-    """이미 관심종목(interestItem_interest_item, proc_yn='Y')으로 등록된 종목인지.
-    '0001'/'1001'(지수 코드)은 제외. 관심종목 편입 텔레그램을 이미 등록된 종목에는
-    보내지 않기 위해 쓴다(사용자 요청). 조회에 실패하면 '미등록'으로 단정할 수
-    없으므로 None을 반환한다 — 호출부가 이 경우 전송하지 않는다."""
+_INTEREST_WHERE = ("WHERE code NOT IN ('0001', '1001') AND proc_yn = 'Y' AND code = %s ")
+
+
+def normalize_watch_type(value) -> str:
+    """'B, A'·['A','B'] → 'A,B'. 관심유형 코드(A~D)만 정렬해 콤마로 잇는다
+    (simul_server._parse_watch_type과 같은 저장 형식)."""
+    items = value if isinstance(value, (list, tuple, set)) else str(value or "").split(",")
+    return ",".join(sorted({str(v).strip() for v in items} & {"A", "B", "C", "D"}))
+
+
+def interest_item_watch_type(stock_code: str, *, nick_name: str = "phills75") -> tuple[Optional[bool], Optional[str]]:
+    """관심종목(interestItem_interest_item, proc_yn='Y') 등록 여부와 현재 관심유형(watch_type).
+    '0001'/'1001'(지수 코드)은 제외. 반환: (True, 'A,B') / (False, None) / 조회 실패 시
+    (None, None) — 실패는 '미등록'으로 단정할 수 없으므로 호출부가 알림도 변경도 하지 않는다.
+    같은 종목의 활성 행이 여럿이면 가장 최근에 바뀐 행의 값을 쓴다."""
     if not stock_code:
-        return None
+        return None, None
     try:
         conn = _connect()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    'SELECT 1 FROM public."interestItem_interest_item" '
-                    "WHERE code NOT IN ('0001', '1001') AND proc_yn = 'Y' AND code = %s "
-                    'AND acct_no IN (SELECT acct_no FROM public."stockAccount_stock_account" '
-                    "WHERE nick_name = %s) LIMIT 1",
-                    (stock_code.zfill(6), nick_name),
-                )
-                return cur.fetchone() is not None
+                cur.execute('SELECT watch_type FROM public."interestItem_interest_item" '
+                            + _INTEREST_WHERE + " ORDER BY last_chg_date DESC LIMIT 1",
+                            (stock_code.zfill(6),))
+                row = cur.fetchone()
+            return (True, row[0]) if row else (False, None)
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
-        logger.warning("관심종목 등록 여부 조회 실패(%s): %s", stock_code, e)
-        return None
+        logger.warning("관심종목 조회 실패(%s): %s", stock_code, e)
+        return None, None
+
+
+def update_interest_watch_type(stock_code: str, watch_type: str, *,
+                               nick_name: str = "phills75") -> int:
+    """등록된 관심종목(proc_yn='Y')의 관심유형을 바꾼다. 다른 갱신 경로(simul_server
+    관심종목 등록, reservebot 항목 수정)처럼 last_chg_date도 함께 갱신한다. 이미 같은
+    값인 행은 건드리지 않는다. 반환: 바뀐 행 수. 예외는 호출부가 처리한다."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE public."interestItem_interest_item" '
+                        "SET watch_type = %s, last_chg_date = now() "
+                        + _INTEREST_WHERE + " AND watch_type IS DISTINCT FROM %s",
+                        (watch_type, stock_code.zfill(6), watch_type))
+            n = cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
