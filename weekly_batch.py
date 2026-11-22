@@ -1,12 +1,13 @@
 """
 weekly_batch.py
 ================
-투자관리 종목(invest_mng)을 대상으로 mvp_graph.run()을 순차 실행하는
-주간 배치. 매주 일요일 1회 cron으로 기동하는 것을 전제로 한다 — 스케줄('언제')은
+투자관리 종목(invest_mng)과 관심종목(interestItem_interest_item)을 대상으로
+mvp_graph.run()을 순차 실행하는 주간 배치. 매주 일요일 1회 cron으로 기동하는 것을 전제로 한다 — 스케줄('언제')은
 cron(또는 이 스크립트를 감싸는 쉘 스크립트)이 담당하고, 이 파일은 '실행되면
 무엇을 할지'만 담당한다.
 
-대상 종목 선정: analysis_history에 investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 invest_mng 의 6자리 종목코드 & proc_yn='Y' 중복 제거해 가져온다.
+대상 종목 선정: analysis_history에 investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 invest_mng 의 6자리 종목코드 & proc_yn='Y'에,
+관심종목(proc_yn='Y', 지수 코드 제외) 중 같은 7일 기준을 넘었거나 유효 이력이 없는 종목을 더해 중복 제거해 가져온다(list_target_stocks).
 이 테이블에는 상품유형 컬럼이 없어 ETF/ETN은 종목명 브랜드 접두사로
 걸러낸다(_is_etf_name). 종목별 실행은 서로 독립적으로 예외 처리되어 한 종목의
 수집/분석 실패가 나머지 종목 실행을 막지 않는다. mvp_graph의 3단계(analysis_history
@@ -81,8 +82,16 @@ def _connect():
 
 
 def list_target_stocks() -> list[dict]:
-    """6자리 종목코드 & proc_yn='Y' 이면서, analysis_history에 investment_summary가
-    채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 종목. ETF 제외.
+    """배치 대상 종목(ETF 제외, 종목코드 중복 제거). 두 출처를 합친다:
+
+    - 투자관리(invest_mng): 6자리 종목코드 & proc_yn='Y' 이면서, analysis_history에
+      investment_summary가 채워진 이력이 있고 그 최근 run_at 일자가 7일 이상 지난 종목.
+    - 관심종목(interestItem_interest_item, 사용자 요청): 6자리 종목코드 & proc_yn='Y'
+      (지수 코드 '0001'/'1001' 제외) 이면서, 같은 7일 기준을 넘었거나 아직 유효한
+      분석 이력이 없는 종목(새로 등록한 관심종목도 첫 분석이 되도록).
+
+    두 곳에 모두 있으면 투자관리 쪽으로 친다(in_invest_mng=True — 분석 후
+    invest_mng 갱신 대상). 관심종목에만 있으면 invest_mng 갱신은 하지 않는다.
 
     날짜를 'YYYYMMDD'로 자른 뒤 비교하므로 '<=' 이어야 매주 정확히 7일 간격
     cron으로 돌 때도 경계에서 스킵되지 않는다 — '<'였을 때는 '정확히 7일 지남'
@@ -91,20 +100,32 @@ def list_target_stocks() -> list[dict]:
     conn = _connect()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 파라미터 없이 실행하므로 LIKE의 '%'는 그대로 쓴다(이스케이프 불필요).
             cur.execute(
-                "SELECT m.code, m.name FROM public.invest_mng m "
-                "JOIN ("
+                "WITH c AS ("
+                "  SELECT to_char(date_trunc('day', current_date - interval '7 day'), 'YYYYMMDD') AS cutoff"
+                "), h AS ("
                 "  SELECT stock_code, MAX(run_at) AS last_run_at "
                 "  FROM public.analysis_history "
                 "  WHERE investment_summary IS NOT NULL AND investment_summary NOT LIKE '%미생성%' "
                 "  GROUP BY stock_code"
-                ") h ON h.stock_code = m.code "
-                "WHERE length(m.code) = 6 AND m.proc_yn = 'Y' "
-                "AND to_char(h.last_run_at, 'YYYYMMDD') <= to_char(date_trunc('day', current_date - interval '7 day'), 'YYYYMMDD') "
-                "GROUP BY m.code, m.name ORDER BY m.code"
+                "), cand AS ("
+                "  SELECT m.code, m.name, TRUE AS in_invest_mng FROM public.invest_mng m "
+                "  JOIN h ON h.stock_code = m.code CROSS JOIN c "
+                "  WHERE length(m.code) = 6 AND m.proc_yn = 'Y' "
+                "  AND to_char(h.last_run_at, 'YYYYMMDD') <= c.cutoff "
+                "  UNION ALL "
+                "  SELECT i.code, i.name, FALSE FROM public.\"interestItem_interest_item\" i "
+                "  LEFT JOIN h ON h.stock_code = i.code CROSS JOIN c "
+                "  WHERE length(i.code) = 6 AND i.proc_yn = 'Y' AND i.code NOT IN ('0001', '1001') "
+                "  AND i.code NOT IN (SELECT code FROM public.invest_mng WHERE proc_yn = 'Y') "
+                "  AND (h.last_run_at IS NULL OR to_char(h.last_run_at, 'YYYYMMDD') <= c.cutoff)"
+                ") "
+                "SELECT code, MIN(name) AS name, bool_or(in_invest_mng) AS in_invest_mng "
+                "FROM cand GROUP BY code ORDER BY code"
             )
             rows = cur.fetchall()
-        return [{"stock_code": r["code"], "corp_name": r["name"]}
+        return [{"stock_code": r["code"], "corp_name": r["name"], "in_invest_mng": r["in_invest_mng"]}
                 for r in rows if not _is_etf_name(r["name"])]
     finally:
         conn.close()
@@ -138,9 +159,12 @@ def run_batch(limit: int | None = None) -> None:
         return
 
     labels = [f"{s['stock_code']}({s.get('corp_name') or '?'})" for s in stocks]
-    log.info("배치 대상 %d개 종목: %s", len(stocks), ", ".join(labels))
+    n_interest = sum(1 for s in stocks if not s.get("in_invest_mng", True))
+    log.info("배치 대상 %d개 종목(투자관리 %d, 관심종목 %d): %s", len(stocks),
+             len(stocks) - n_interest, n_interest, ", ".join(labels))
     telegram_alert.send_alert(
-        f"[주간 투자포인트 배치] 시작 — 대상 {len(stocks)}개 종목\n"
+        f"[주간 투자포인트 배치] 시작 — 대상 {len(stocks)}개 종목"
+        f"(투자관리 {len(stocks) - n_interest}, 관심종목 {n_interest})\n"
         f"{_fmt_stock_list(labels)}")
 
     ok, failed = 0, []
@@ -159,7 +183,10 @@ def run_batch(limit: int | None = None) -> None:
                 llm_failed.append(f"{code}({name})")
             # 분석이 끝났으면 최신 이력을 invest_mng에 반영(LLM 실패 시엔 이력이 비어
             # 있을 수 있어 건너뜀). 반영 실패는 분석 성공 여부와 분리해 경고만 남긴다.
-            if not result.get("llm_error"):
+            if not result.get("llm_error") and not s.get("in_invest_mng", True):
+                # 관심종목에만 있는 종목: invest_mng 행이 없으니 갱신하지 않는다.
+                log.info("[%d/%d] %s(%s) 관심종목 대상 — invest_mng 갱신 생략", i, len(stocks), code, name)
+            elif not result.get("llm_error"):
                 try:
                     if update_invest_mng(code):
                         log.info("[%d/%d] %s(%s) invest_mng 갱신 완료", i, len(stocks), code, name)
