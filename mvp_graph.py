@@ -582,10 +582,10 @@ def check_value_investment(state: AnalysisState) -> AnalysisState:
 
 
 def screen_watchlist(state: AnalysisState) -> AnalysisState:
-    """트레이딩 계획서 2장 '관심종목 선정' 판정(watchlist_screen.py) 후, 새로
-    편입된 유형이 있으면 텔레그램으로 알린다. 판정 결과(편입 유형)는 save_history가
-    analysis_history.watchlist_types에 저장하고, 다음 실행은 직전 값과 비교해
-    새로 생긴 유형만 알린다(주간 배치가 매주 같은 알림을 반복하지 않도록).
+    """트레이딩 계획서 2장 '관심종목 선정' 판정(watchlist_screen.py) 후, 관심종목에
+    미등록인 편입 종목은 텔레그램으로 알린다(등록된 종목은 watch_type만 맞춘다).
+    판정 결과(편입 유형)는 save_history가 analysis_history.watchlist_types에 저장하고,
+    다음 실행은 직전 값과 비교해 새로 생긴 유형을 알림 본문에 '(신규)'로 표시한다.
 
     비싼 조회는 앞 단계를 통과한 종목만 한다: 52주 고점 대비 -30% 미달이면 바로
     종료, D의 실적 조건이 맞을 때만 일별 시세 조회, 유형이 하나라도 맞을 때만
@@ -660,18 +660,25 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
 
     # 관심종목(interestItem_interest_item) 처리(사용자 확정):
     #   - 이미 등록됨: watch_type이 이번 편입 유형과 다르면 바꾼다(알림은 보내지 않음).
-    #   - 미등록: 등록은 하지 않고(가격 6개가 필요해 사람이 화면에서 등록), 새로 편입된
-    #     유형이 있을 때 지금처럼 텔레그램으로 알린다.
+    #   - 미등록: 등록은 하지 않고(가격 6개가 필요해 사람이 화면에서 등록), 편입될 때마다
+    #     텔레그램으로 알린다(새로 생긴 유형은 '(신규)'로 표시).
     #   - 조회 실패: '미등록'으로 단정할 수 없어 알림도 변경도 하지 않는다.
     import invest_mng_lookup
     types_str = invest_mng_lookup.normalize_watch_type(result["types"])
     registered, cur_watch_type = invest_mng_lookup.interest_item_watch_type(code)
     if registered is True:
         if invest_mng_lookup.normalize_watch_type(cur_watch_type) != types_str:
+            # 관심유형을 바꿀 때 시장구분/규모/업종/시가총액도 현재 시점 값으로 맞춘다
+            # (사용자 요청). KIS 조회 실패는 관심유형 변경을 막지 않고 기존 값을 유지한다.
             try:
-                n = invest_mng_lookup.update_interest_watch_type(code, types_str)
-                log.info("관심종목 관심유형 변경(%s/%s): %s → %s (%d행)", code, name,
-                         cur_watch_type or "없음", types_str, n)
+                meta = invest_mng_lookup.fetch_market_meta(code)
+            except Exception as e:  # noqa: BLE001
+                log.warning("관심종목 시장정보 조회 실패(%s) — 기존 값 유지: %s", code, e)
+                meta = None
+            try:
+                n = invest_mng_lookup.update_interest_watch_type(code, types_str, meta=meta)
+                log.info("관심종목 관심유형 변경(%s/%s): %s → %s (%d행) 시장정보 %s", code, name,
+                         cur_watch_type or "없음", types_str, n, meta or "유지")
                 result["watch_type_changed"] = {"from": cur_watch_type, "to": types_str}
             except Exception as e:  # noqa: BLE001
                 log.warning("관심종목 관심유형 변경 실패(%s): %s", code, e)
@@ -679,8 +686,10 @@ def screen_watchlist(state: AnalysisState) -> AnalysisState:
             log.info("관심종목 편입 알림 생략(%s/%s): 이미 관심종목에 등록됨(관심유형 %s 동일)",
                      code, name, types_str)
     elif registered is False:
-        if new_types:
-            telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
+        # 미등록이면 신규 유형 여부와 무관하게 매번 알린다(사용자 확정) — 직전 이력과
+        # 유형이 같아도 관심종목에서 해제(proc_yn='N')된 종목은 다시 알려야 하므로.
+        # new_types는 본문의 '(신규)' 표시에만 쓴다.
+        telegram_alert.send_alert(ws.format_alert(name, code, result, new_types, price))
     else:
         log.info("관심종목 편입 알림·관심유형 변경 생략(%s/%s): 관심종목 조회 실패", code, name)
     return {"watchlist": result}
