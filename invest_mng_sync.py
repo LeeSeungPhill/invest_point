@@ -10,6 +10,7 @@ stdout 인코딩 변경 같은 것은 weekly_batch.py에만 둔다.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime
@@ -106,6 +107,17 @@ def update_invest_mng(code: str) -> bool:
     # 값은 invest_mng.high_price 대비 현재가 기준이라 high_price는 DB 행에서 읽는다.
     remain_rate_eligible = row.get("매출액-5") is not None and sales_ok
 
+    # 시장구분/규모/업종/시가총액: 현재 시점 KIS 현재가 조회값(관심종목 관심유형 변경과
+    # 같은 invest_mng_lookup.fetch_market_meta — 사용자 요청). 조회 실패는 갱신 전체를
+    # 막지 않고 COALESCE로 기존 값을 유지한다.
+    try:
+        import invest_mng_lookup
+        meta = invest_mng_lookup.fetch_market_meta(code)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("invest_mng_sync").warning(
+            "invest_mng 시장정보 조회 실패(%s) — 기존 값 유지: %s", code, e)
+        meta = {}
+
     conn = _connect()
     try:
         with conn.cursor() as cur:
@@ -131,6 +143,10 @@ def update_invest_mng(code: str) -> bool:
                     invest_point = COALESCE(%s, invest_point),
                     invest_risk = COALESCE(%s, invest_risk),
                     value_invest = COALESCE(%s, value_invest),
+                    market = COALESCE(%s, market),
+                    size = COALESCE(%s, size),
+                    industry = COALESCE(%s, industry),
+                    mktcap = COALESCE(%s, mktcap),
                     -- 배당 안정성 점수: dividend_check는 투자관리 화면에서 직접 입력하는
                     -- 칸이기도 하다. 비어 있거나 이전 자동값('[자동]'으로 시작)일 때만
                     -- 덮어써서 사용자가 적어 둔 메모를 지우지 않는다.
@@ -145,6 +161,7 @@ def update_invest_mng(code: str) -> bool:
                  row.get("rcept_dt") or None,
                  parsed["invest_issue"] or None, parsed["invest_point"] or None,
                  parsed["invest_risk"] or None, row.get("value_invest") or None,
+                 meta.get("market"), meta.get("size"), meta.get("industry"), meta.get("mktcap"),
                  row.get("dividend_check"), "[자동]%", row.get("dividend_check"),
                  datetime.now().strftime("%Y%m%d"), code),
             )
